@@ -1,0 +1,16 @@
+﻿[package]
+name = "apk_info_backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+quick-xml = "0.38"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+zip = "2"
+
+[dev-dependencies]
+tempfile = "3"

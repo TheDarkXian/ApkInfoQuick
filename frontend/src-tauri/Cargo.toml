@@ -1,0 +1,14 @@
+[package]
+name = "apk_info_quick_tauri"
+version = "0.1.0"
+description = "Tauri shell for ApkInfoQuick frontend"
+edition = "2021"
+
+[package.metadata]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+apk_info_backend = { path = "../../backend" }
+tauri = { version = "2", features = [] }
