@@ -1,9 +1,10 @@
-﻿
 use std::collections::{BTreeSet, HashMap};
+use std::env;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -33,13 +34,33 @@ pub fn parse_apk_tauri(file_path: String) -> ApkInfoEnvelope {
 fn parse_apk(path: &Path) -> Result<(ApkInfoData, Vec<String>), (BackendError, Vec<String>)> {
     input_validation::validate_input(path).map_err(|e| (e, Vec::new()))?;
 
+    match aapt_parser::parse(path) {
+        Ok(mut parsed) => {
+            enrich_aapt_data(path, &mut parsed.data, &mut parsed.warnings);
+            return Ok((parsed.data, parsed.warnings));
+        }
+        Err(aapt_parser::AaptError::NotFound) => {
+            let (data, mut warnings) = parse_apk_rust(path)?;
+            push_warning(&mut warnings, warnings::AAPT_NOT_FOUND_FALLBACK_USED);
+            return Ok((data, warnings));
+        }
+        Err(_) => {
+            let (data, mut warnings) = parse_apk_rust(path)?;
+            push_warning(&mut warnings, warnings::AAPT_BADGING_FAILED_FALLBACK_USED);
+            return Ok((data, warnings));
+        }
+    }
+}
+
+fn parse_apk_rust(path: &Path) -> Result<(ApkInfoData, Vec<String>), (BackendError, Vec<String>)> {
     let file = File::open(path).map_err(|_| (BackendError::ApkOpenFailed, Vec::new()))?;
-    let mut archive = ZipArchive::new(file).map_err(|_| (BackendError::ApkOpenFailed, Vec::new()))?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|_| (BackendError::ApkOpenFailed, Vec::new()))?;
 
     let mut warnings = Vec::new();
 
-    let manifest_bytes = archive_reader::read_manifest_bytes(&mut archive)
-        .map_err(|e| (e, warnings.clone()))?;
+    let manifest_bytes =
+        archive_reader::read_manifest_bytes(&mut archive).map_err(|e| (e, warnings.clone()))?;
 
     let mut manifest = manifest_reader::parse_manifest(&manifest_bytes, &mut warnings)
         .map_err(|e| (e, warnings.clone()))?;
@@ -55,7 +76,26 @@ fn parse_apk(path: &Path) -> Result<(ApkInfoData, Vec<String>), (BackendError, V
     Ok((data, warnings))
 }
 
+fn enrich_aapt_data(path: &Path, data: &mut ApkInfoData, warnings: &mut Vec<String>) {
+    let Ok(file) = File::open(path) else {
+        return;
+    };
+    let Ok(mut archive) = ZipArchive::new(file) else {
+        return;
+    };
+
+    let manifest = archive_reader::read_manifest_bytes(&mut archive)
+        .ok()
+        .and_then(|bytes| manifest_reader::parse_manifest(&bytes, warnings).ok())
+        .unwrap_or_default();
+
+    data.channel = channel_resolver::resolve(&manifest, path, &mut archive, warnings);
+    data.signers = signer_reader::extract_signers(path, &mut archive, warnings);
+}
+
 mod warnings {
+    pub const AAPT_NOT_FOUND_FALLBACK_USED: &str = "AAPT_NOT_FOUND_FALLBACK_USED";
+    pub const AAPT_BADGING_FAILED_FALLBACK_USED: &str = "AAPT_BADGING_FAILED_FALLBACK_USED";
     pub const CHANNEL_NOT_FOUND: &str = "CHANNEL_NOT_FOUND";
     pub const ICON_NOT_FOUND: &str = "ICON_NOT_FOUND";
     pub const ICON_MANIFEST_REF_UNRESOLVED: &str = "ICON_MANIFEST_REF_UNRESOLVED";
@@ -65,6 +105,9 @@ mod warnings {
     pub const APP_NAME_UNRESOLVED: &str = "APP_NAME_UNRESOLVED";
     pub const APP_NAME_PICKED_STRING_REF: &str = "APP_NAME_PICKED_STRING_REF";
     pub const APP_NAME_PICKED_RESOURCE_ID: &str = "APP_NAME_PICKED_RESOURCE_ID";
+    pub const APP_NAME_PICKED_AAPT_LABEL: &str = "APP_NAME_PICKED_AAPT_LABEL";
+    pub const ICON_PICKED_AAPT_BADGING: &str = "ICON_PICKED_AAPT_BADGING";
+    pub const ICON_PICKED_AAPT_XMLTREE: &str = "ICON_PICKED_AAPT_XMLTREE";
     pub const SIGNATURE_PARTIAL: &str = "SIGNATURE_PARTIAL";
     pub const SIGNATURE_BLOCK_DETECTED_UNPARSED: &str = "SIGNATURE_BLOCK_DETECTED_UNPARSED";
     pub const MANIFEST_BINARY_PARTIAL: &str = "MANIFEST_BINARY_PARTIAL";
@@ -79,6 +122,503 @@ fn push_warning(warnings: &mut Vec<String>, code: &str) {
 fn push_warning_owned(warnings: &mut Vec<String>, code: String) {
     if !warnings.iter().any(|w| w == &code) {
         warnings.push(code);
+    }
+}
+
+mod aapt_parser {
+    use super::*;
+
+    #[derive(Debug)]
+    pub enum AaptError {
+        NotFound,
+        CommandFailed,
+        BadgingParseFailed,
+    }
+
+    pub struct AaptParseResult {
+        pub data: ApkInfoData,
+        pub warnings: Vec<String>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct IconCandidate {
+        path: String,
+        score: i32,
+    }
+
+    #[derive(Debug, Default)]
+    struct BadgingInfo {
+        package_name: String,
+        app_name: String,
+        version_code: i64,
+        version_name: Option<String>,
+        min_sdk_version: i32,
+        target_sdk_version: i32,
+        compile_sdk_version: Option<i32>,
+        permissions: Vec<String>,
+        abis: Vec<String>,
+        icon_candidates: Vec<IconCandidate>,
+    }
+
+    pub fn parse(apk_path: &Path) -> Result<AaptParseResult, AaptError> {
+        let aapt = find_aapt().ok_or(AaptError::NotFound)?;
+        let badging = run_aapt(&aapt, &["d", "--include-meta-data", "badging"], apk_path)?;
+        let info = parse_badging(&badging).ok_or(AaptError::BadgingParseFailed)?;
+
+        let mut warnings = Vec::new();
+        super::push_warning(&mut warnings, super::warnings::APP_NAME_PICKED_AAPT_LABEL);
+        let icon_url = extract_icon(apk_path, &aapt, &info.icon_candidates, &mut warnings);
+
+        Ok(AaptParseResult {
+            data: ApkInfoData {
+                package_name: info.package_name,
+                app_name: info.app_name,
+                icon_url,
+                min_sdk_version: info.min_sdk_version,
+                target_sdk_version: info.target_sdk_version,
+                compile_sdk_version: info.compile_sdk_version,
+                version_code: info.version_code,
+                version_name: info.version_name,
+                permissions: dedup(info.permissions),
+                signers: Vec::new(),
+                abis: dedup(info.abis),
+                channel: "unknown".to_string(),
+            },
+            warnings,
+        })
+    }
+
+    fn find_aapt() -> Option<PathBuf> {
+        for root in current_roots() {
+            let candidate = root.join("tools").join("android").join(aapt_file_name());
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+
+        if let Ok(raw) = env::var("APK_INFO_AAPT") {
+            let path = PathBuf::from(raw);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+
+        find_on_path(aapt_file_name())
+    }
+
+    fn current_roots() -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(dir) = env::current_dir() {
+            out.extend(dir.ancestors().map(Path::to_path_buf));
+        }
+        if let Ok(exe) = env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                out.extend(parent.ancestors().map(Path::to_path_buf));
+            }
+        }
+        out
+    }
+
+    fn aapt_file_name() -> &'static str {
+        if cfg!(windows) {
+            "aapt.exe"
+        } else {
+            "aapt"
+        }
+    }
+
+    fn find_on_path(file_name: &str) -> Option<PathBuf> {
+        let path = env::var_os("PATH")?;
+        for dir in env::split_paths(&path) {
+            let candidate = dir.join(file_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    fn run_aapt(aapt: &Path, args: &[&str], apk_path: &Path) -> Result<String, AaptError> {
+        let output = Command::new(aapt)
+            .args(args)
+            .arg(apk_path)
+            .output()
+            .map_err(|_| AaptError::CommandFailed)?;
+        if !output.status.success() {
+            return Err(AaptError::CommandFailed);
+        }
+        let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+        if text.trim().is_empty() {
+            text = String::from_utf8_lossy(&output.stderr).to_string();
+        }
+        if text.trim().is_empty() {
+            return Err(AaptError::CommandFailed);
+        }
+        Ok(text)
+    }
+
+    fn run_aapt_with_extra(
+        aapt: &Path,
+        args: &[&str],
+        apk_path: &Path,
+        extra: &str,
+    ) -> Result<String, AaptError> {
+        let output = Command::new(aapt)
+            .args(args)
+            .arg(apk_path)
+            .arg(extra)
+            .output()
+            .map_err(|_| AaptError::CommandFailed)?;
+        if !output.status.success() {
+            return Err(AaptError::CommandFailed);
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    fn parse_badging(output: &str) -> Option<BadgingInfo> {
+        let mut info = BadgingInfo {
+            min_sdk_version: 1,
+            target_sdk_version: 1,
+            version_code: 1,
+            ..BadgingInfo::default()
+        };
+        let mut default_label = String::new();
+        let mut zh_label = String::new();
+        let mut zh_cn_label = String::new();
+
+        for raw_line in output.lines() {
+            let line = raw_line.trim();
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+
+            match key {
+                "package" => {
+                    info.package_name = attr(value, "name").unwrap_or_default();
+                    info.version_code = attr(value, "versionCode")
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .unwrap_or(1);
+                    info.version_name = attr(value, "versionName").filter(|v| !v.is_empty());
+                    info.compile_sdk_version =
+                        attr(value, "compileSdkVersion").and_then(|v| v.parse::<i32>().ok());
+                }
+                "sdkVersion" => {
+                    info.min_sdk_version = quoted(value)
+                        .and_then(|v| v.parse::<i32>().ok())
+                        .unwrap_or(1);
+                }
+                "targetSdkVersion" => {
+                    info.target_sdk_version = quoted(value)
+                        .and_then(|v| v.parse::<i32>().ok())
+                        .unwrap_or(1);
+                }
+                "uses-permission" => {
+                    if let Some(permission) = attr(value, "name").or_else(|| quoted(value)) {
+                        if !permission.is_empty() {
+                            info.permissions.push(permission);
+                        }
+                    }
+                }
+                "native-code" | "alt-native-code" => {
+                    info.abis.extend(all_quoted(value));
+                }
+                "application-label" => {
+                    default_label = quoted(value).unwrap_or_default();
+                }
+                "application-label-zh" => {
+                    zh_label = quoted(value).unwrap_or_default();
+                }
+                "application-label-zh-CN" | "application-label-zh-rCN" => {
+                    zh_cn_label = quoted(value).unwrap_or_default();
+                }
+                "application" | "launchable-activity" | "leanback-launchable-activity" => {
+                    if default_label.is_empty() {
+                        default_label = attr(value, "label").unwrap_or_default();
+                    }
+                    if let Some(icon) = attr(value, "icon") {
+                        info.icon_candidates.push(IconCandidate {
+                            path: icon,
+                            score: 100,
+                        });
+                    }
+                }
+                _ => {
+                    if let Some(density) = key.strip_prefix("application-icon-") {
+                        if let Some(path) = quoted(value) {
+                            info.icon_candidates.push(IconCandidate {
+                                path,
+                                score: 200 + density_score(density),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        info.app_name = first_non_empty([zh_cn_label, zh_label, default_label])?;
+        if info.package_name.is_empty() {
+            return None;
+        }
+        info.icon_candidates.sort_by(|a, b| b.score.cmp(&a.score));
+        Some(info)
+    }
+
+    fn first_non_empty(items: [String; 3]) -> Option<String> {
+        items
+            .into_iter()
+            .map(|item| item.trim().to_string())
+            .find(|item| !item.is_empty())
+    }
+
+    fn attr(value: &str, name: &str) -> Option<String> {
+        between(value, &format!("{name}='"), "'")
+    }
+
+    fn quoted(value: &str) -> Option<String> {
+        between(value, "'", "'")
+    }
+
+    fn all_quoted(value: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = value;
+        while let Some(start) = rest.find('\'') {
+            rest = &rest[start + 1..];
+            let Some(end) = rest.find('\'') else {
+                break;
+            };
+            let item = rest[..end].to_string();
+            if !item.is_empty() {
+                out.push(item);
+            }
+            rest = &rest[end + 1..];
+        }
+        out
+    }
+
+    fn between(value: &str, from: &str, to: &str) -> Option<String> {
+        let start = value.find(from)? + from.len();
+        let end = value[start..].find(to)? + start;
+        Some(value[start..end].to_string())
+    }
+
+    fn density_score(value: &str) -> i32 {
+        let lower = value.to_ascii_lowercase();
+        if lower == "640" || lower.contains("xxxhdpi") {
+            70
+        } else if lower == "480" || lower.contains("xxhdpi") {
+            60
+        } else if lower == "320" || lower.contains("xhdpi") {
+            50
+        } else if lower == "240" || lower.contains("hdpi") {
+            40
+        } else if lower == "213" || lower.contains("tvdpi") {
+            35
+        } else if lower == "160" || lower.contains("mdpi") {
+            30
+        } else if lower == "120" || lower.contains("ldpi") {
+            20
+        } else {
+            10
+        }
+    }
+
+    fn extract_icon(
+        apk_path: &Path,
+        aapt: &Path,
+        candidates: &[IconCandidate],
+        warnings: &mut Vec<String>,
+    ) -> String {
+        let Ok(file) = File::open(apk_path) else {
+            return String::new();
+        };
+        let Ok(mut archive) = ZipArchive::new(file) else {
+            return String::new();
+        };
+
+        let mut candidates = candidates.to_vec();
+        candidates.sort_by(|a, b| b.score.cmp(&a.score));
+        for candidate in candidates {
+            if candidate.path.ends_with(".xml") {
+                if let Some(path) = resolve_xml_icon(apk_path, aapt, &candidate.path) {
+                    if let Some(url) = extract_zip_icon(apk_path, &mut archive, &path) {
+                        super::push_warning(warnings, super::warnings::ICON_PICKED_AAPT_XMLTREE);
+                        return url;
+                    }
+                }
+            } else if let Some(url) = extract_zip_icon(apk_path, &mut archive, &candidate.path) {
+                super::push_warning(warnings, super::warnings::ICON_PICKED_AAPT_BADGING);
+                return url;
+            }
+        }
+        String::new()
+    }
+
+    fn resolve_xml_icon(apk_path: &Path, aapt: &Path, icon_path: &str) -> Option<String> {
+        let xmltree = run_aapt_with_extra(aapt, &["d", "xmltree"], apk_path, icon_path).ok()?;
+        let ids = parse_xmltree_refs(&xmltree);
+        if ids.is_empty() {
+            return None;
+        }
+        let resources = run_aapt(aapt, &["d", "resources"], apk_path).ok()?;
+        for id in ids.into_iter().rev() {
+            if let Some(name) = parse_resource_name(&resources, &id) {
+                return Some(format!("res/{name}.png"));
+            }
+        }
+        None
+    }
+
+    fn parse_xmltree_refs(xmltree: &str) -> Vec<String> {
+        xmltree
+            .lines()
+            .filter(|line| line.contains("android:drawable") || line.contains("android:src"))
+            .filter_map(extract_xmltree_resource_id)
+            .map(clean_resource_id)
+            .filter(|item| !item.is_empty())
+            .collect()
+    }
+
+    fn extract_xmltree_resource_id(line: &str) -> Option<&str> {
+        if let Some(start) = line.find("@0x") {
+            return Some(&line[start + 1..]);
+        }
+        line.rsplit('@').next()
+    }
+
+    fn clean_resource_id(raw: &str) -> String {
+        raw.trim()
+            .trim_matches(')')
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(')')
+            .to_string()
+    }
+
+    fn parse_resource_name(resources: &str, id: &str) -> Option<String> {
+        for line in resources.lines() {
+            if !line.contains(id) || !line.contains("spec resource") {
+                continue;
+            }
+            if let Some(name) = line
+                .split_whitespace()
+                .find(|part| part.contains(':') && part.contains('/'))
+            {
+                return name
+                    .split_once(':')
+                    .map(|(_, right)| right.trim_end_matches(':').to_string());
+            }
+        }
+        None
+    }
+
+    fn extract_zip_icon(
+        apk_path: &Path,
+        archive: &mut ZipArchive<File>,
+        raw_path: &str,
+    ) -> Option<String> {
+        let entry_name = best_matching_entry(archive, raw_path)?;
+        let mut entry = archive.by_name(&entry_name).ok()?;
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf).ok()?;
+        write_icon_to_temp(apk_path, &entry_name, &buf)
+    }
+
+    fn best_matching_entry(archive: &mut ZipArchive<File>, raw_path: &str) -> Option<String> {
+        if archive.by_name(raw_path).is_ok() {
+            return Some(raw_path.to_string());
+        }
+
+        let base = Path::new(raw_path)
+            .file_name()?
+            .to_string_lossy()
+            .to_string();
+        let mut best: Option<(String, i32)> = None;
+        for i in 0..archive.len() {
+            let Ok(file) = archive.by_index(i) else {
+                continue;
+            };
+            let name = file.name().to_string();
+            if !name.starts_with("res/") || !name.ends_with(&base) {
+                continue;
+            }
+            if !(name.starts_with("res/mipmap") || name.starts_with("res/drawable")) {
+                continue;
+            }
+            let score = density_score(&name) + (file.size() as i32 / 1024).min(20);
+            if best.as_ref().map(|(_, old)| score > *old).unwrap_or(true) {
+                best = Some((name, score));
+            }
+        }
+        best.map(|(name, _)| name)
+    }
+
+    fn write_icon_to_temp(apk_path: &Path, entry_name: &str, bytes: &[u8]) -> Option<String> {
+        let dir = env::temp_dir().join("apk-info-icons");
+        std::fs::create_dir_all(&dir).ok()?;
+        let stem = apk_path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .unwrap_or("app")
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let digest = Sha256::digest(entry_name.as_bytes());
+        let suffix = format!("{:x}", digest);
+        let ext = Path::new(entry_name)
+            .extension()
+            .and_then(OsStr::to_str)
+            .unwrap_or("png");
+        let target = dir.join(format!("{stem}-{}.{}", &suffix[..12], ext));
+        std::fs::write(&target, bytes).ok()?;
+        Some(format!(
+            "file:///{}",
+            target.to_string_lossy().replace('\\', "/")
+        ))
+    }
+
+    fn dedup(items: Vec<String>) -> Vec<String> {
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        for item in items {
+            if seen.insert(item.clone()) {
+                out.push(item);
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_parse_badging(
+        output: &str,
+    ) -> Option<(String, String, Vec<String>, Vec<String>, String)> {
+        let parsed = parse_badging(output)?;
+        let icon = parsed
+            .icon_candidates
+            .first()
+            .map(|item| item.path.clone())
+            .unwrap_or_default();
+        Some((
+            parsed.package_name,
+            parsed.app_name,
+            parsed.permissions,
+            parsed.abis,
+            icon,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_parse_xmltree_resources(xmltree: &str, resources: &str) -> Vec<String> {
+        parse_xmltree_refs(xmltree)
+            .into_iter()
+            .filter_map(|id| parse_resource_name(resources, &id))
+            .collect()
     }
 }
 
@@ -187,7 +727,10 @@ mod manifest_reader {
 
     const NO_INDEX: u32 = 0xffff_ffff;
 
-    pub fn parse_manifest(bytes: &[u8], warnings: &mut Vec<String>) -> Result<ManifestInfo, BackendError> {
+    pub fn parse_manifest(
+        bytes: &[u8],
+        warnings: &mut Vec<String>,
+    ) -> Result<ManifestInfo, BackendError> {
         if bytes.first().copied() == Some(b'<') {
             return parse_text_manifest(bytes);
         }
@@ -236,7 +779,10 @@ mod manifest_reader {
         Ok(attrs)
     }
 
-    fn parse_binary_manifest(bytes: &[u8], warnings: &mut Vec<String>) -> Result<ManifestInfo, BackendError> {
+    fn parse_binary_manifest(
+        bytes: &[u8],
+        warnings: &mut Vec<String>,
+    ) -> Result<ManifestInfo, BackendError> {
         if bytes.len() < 8 {
             return Err(BackendError::ManifestParseFailed);
         }
@@ -269,7 +815,11 @@ mod manifest_reader {
                     strings = parse_string_pool(&bytes[offset..offset + chunk_size])?;
                 }
                 RES_XML_START_ELEMENT_TYPE => {
-                    parse_binary_start_element(&bytes[offset..offset + chunk_size], &strings, &mut info)?;
+                    parse_binary_start_element(
+                        &bytes[offset..offset + chunk_size],
+                        &strings,
+                        &mut info,
+                    )?;
                 }
                 _ => {}
             }
@@ -981,7 +1531,10 @@ mod resource_resolver {
             return Some((first as usize, start + 1));
         }
         let second = *chunk.get(start + 1)?;
-        Some(((((first & 0x7f) as usize) << 8) | second as usize, start + 2))
+        Some((
+            (((first & 0x7f) as usize) << 8) | second as usize,
+            start + 2,
+        ))
     }
 
     fn decode_length16(chunk: &[u8], start: usize) -> Option<(usize, usize)> {
@@ -1087,10 +1640,7 @@ mod icon_extractor {
                 let mut buf = Vec::new();
                 if entry.read_to_end(&mut buf).is_ok() {
                     if let Some(url) = write_icon_to_temp(apk_path, &candidate.entry_name, &buf) {
-                        super::push_warning_owned(
-                            warnings,
-                            strategy_tracking_code(strategy_name),
-                        );
+                        super::push_warning_owned(warnings, strategy_tracking_code(strategy_name));
                         return url;
                     }
                 }
@@ -1120,18 +1670,26 @@ mod icon_extractor {
                 }
             }
             IconRef::ResourceName { icon_type, name } => {
-                out.extend(find_by_resource_name(entries, icon_type, name, strategy_name));
-                out.extend(find_adaptive_icon_refs(entries, archive, icon_type, name, warnings));
+                out.extend(find_by_resource_name(
+                    entries,
+                    icon_type,
+                    name,
+                    strategy_name,
+                ));
+                out.extend(find_adaptive_icon_refs(
+                    entries, archive, icon_type, name, warnings,
+                ));
             }
             IconRef::ResourceId(id) => {
                 if let Some((icon_type, name)) = resolve_resource_id_from_arsc(archive, *id) {
-                    out.extend(find_by_resource_name(entries, &icon_type, &name, "ResourceIdArsc"));
-                    out.extend(find_adaptive_icon_refs(
+                    out.extend(find_by_resource_name(
                         entries,
-                        archive,
                         &icon_type,
                         &name,
-                        warnings,
+                        "ResourceIdArsc",
+                    ));
+                    out.extend(find_adaptive_icon_refs(
+                        entries, archive, &icon_type, &name, warnings,
                     ));
                 }
             }
@@ -1238,7 +1796,11 @@ mod icon_extractor {
             }
         }
 
-        if out.is_empty() && entries.iter().any(|e| e.contains("anydpi-v26") && e.ends_with(".xml")) {
+        if out.is_empty()
+            && entries
+                .iter()
+                .any(|e| e.contains("anydpi-v26") && e.ends_with(".xml"))
+        {
             super::push_warning(warnings, super::warnings::ICON_ADAPTIVE_XML_UNRESOLVED);
         }
 
@@ -1301,7 +1863,9 @@ mod icon_extractor {
         if is_blacklisted(entry) {
             return false;
         }
-        ICON_EXTS.iter().any(|ext| entry.ends_with(&format!(".{ext}")))
+        ICON_EXTS
+            .iter()
+            .any(|ext| entry.ends_with(&format!(".{ext}")))
     }
 
     fn is_blacklisted(entry: &str) -> bool {
@@ -1600,7 +2164,10 @@ mod icon_extractor {
             return Some((first as usize, start + 1));
         }
         let second = *chunk.get(start + 1)?;
-        Some(((((first & 0x7f) as usize) << 8) | second as usize, start + 2))
+        Some((
+            (((first & 0x7f) as usize) << 8) | second as usize,
+            start + 2,
+        ))
     }
 
     fn decode_length16(chunk: &[u8], start: usize) -> Option<(usize, usize)> {
@@ -1635,7 +2202,13 @@ mod icon_extractor {
             .and_then(OsStr::to_str)
             .unwrap_or("app")
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect::<String>();
 
         let digest = Sha256::digest(entry_name.as_bytes());
@@ -1689,7 +2262,9 @@ mod signer_reader {
             .filter(|name| {
                 let upper = name.to_uppercase();
                 upper.starts_with("META-INF/")
-                    && (upper.ends_with(".RSA") || upper.ends_with(".DSA") || upper.ends_with(".EC"))
+                    && (upper.ends_with(".RSA")
+                        || upper.ends_with(".DSA")
+                        || upper.ends_with(".EC"))
             })
             .collect::<Vec<_>>();
 
@@ -1729,14 +2304,16 @@ mod signer_reader {
     }
 
     fn has_any_signature_hint(archive: &mut ZipArchive<File>) -> bool {
-        archive_reader::list_entries(archive).into_iter().any(|name| {
-            let upper = name.to_uppercase();
-            upper.starts_with("META-INF/")
-                && (upper.ends_with(".SF")
-                    || upper.ends_with(".RSA")
-                    || upper.ends_with(".DSA")
-                    || upper.ends_with(".EC"))
-        })
+        archive_reader::list_entries(archive)
+            .into_iter()
+            .any(|name| {
+                let upper = name.to_uppercase();
+                upper.starts_with("META-INF/")
+                    && (upper.ends_with(".SF")
+                        || upper.ends_with(".RSA")
+                        || upper.ends_with(".DSA")
+                        || upper.ends_with(".EC"))
+            })
     }
 
     fn has_apk_sig_block(apk_path: &Path) -> bool {
@@ -1943,6 +2520,80 @@ mod tests {
     }
 
     #[test]
+    fn aapt_badging_output_maps_core_fields() {
+        let badging = "\
+package: name='com.demo.aapt' versionCode='42' versionName='4.2' compileSdkVersion='35'
+sdkVersion:'23'
+targetSdkVersion:'35'
+uses-permission: name='android.permission.INTERNET'
+uses-permission: name='android.permission.ACCESS_NETWORK_STATE'
+application-label:'Default Name'
+application-label-zh:'中文名'
+application-label-zh-CN:'中文名 CN'
+application: label='Default Name' icon='res/mipmap-mdpi/ic_launcher.png'
+application-icon-160:'res/mipmap-mdpi/ic_launcher.png'
+application-icon-640:'res/mipmap-xxxhdpi/ic_launcher.png'
+native-code: 'arm64-v8a' 'armeabi-v7a'
+";
+
+        let parsed = aapt_parser::test_parse_badging(badging).expect("parse aapt badging");
+
+        assert_eq!(parsed.0, "com.demo.aapt");
+        assert_eq!(parsed.1, "中文名 CN");
+        assert_eq!(
+            parsed.2,
+            vec![
+                "android.permission.INTERNET".to_string(),
+                "android.permission.ACCESS_NETWORK_STATE".to_string()
+            ]
+        );
+        assert_eq!(
+            parsed.3,
+            vec!["arm64-v8a".to_string(), "armeabi-v7a".to_string()]
+        );
+        assert_eq!(parsed.4, "res/mipmap-xxxhdpi/ic_launcher.png");
+    }
+
+    #[test]
+    fn aapt_badging_prefers_zh_over_default_when_zh_cn_missing() {
+        let badging = "\
+package: name='com.demo.aapt'
+application-label:'Default Name'
+application-label-zh:'中文名'
+";
+
+        let parsed = aapt_parser::test_parse_badging(badging).expect("parse aapt badging");
+
+        assert_eq!(parsed.1, "中文名");
+    }
+
+    #[test]
+    fn aapt_badging_without_label_is_not_accepted_as_main_result() {
+        let badging = "package: name='com.demo.aapt'\n";
+
+        assert!(aapt_parser::test_parse_badging(badging).is_none());
+    }
+
+    #[test]
+    fn aapt_xmltree_resource_ids_map_to_resource_names() {
+        let xmltree = "\
+      A: android:drawable(0x01010199)=@0x7f020001
+      A: android:src(0x01010119)=@0x7f020002 (Raw: \"@drawable/ic_fg\")
+";
+        let resources = "\
+      spec resource 0x7f020001 com.demo:drawable/ic_bg: flags=0x00000000
+      spec resource 0x7f020002 com.demo:drawable/ic_fg: flags=0x00000000
+";
+
+        let names = aapt_parser::test_parse_xmltree_resources(xmltree, resources);
+
+        assert_eq!(
+            names,
+            vec!["drawable/ic_bg".to_string(), "drawable/ic_fg".to_string()]
+        );
+    }
+
+    #[test]
     fn defaults_and_channel_priority_from_manifest() {
         let manifest = r#"<manifest package="com.demo.app" android:versionCode="100" xmlns:android="http://schemas.android.com/apk/res/android"> 
             <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34" />
@@ -1967,7 +2618,10 @@ mod tests {
         assert_eq!(envelope.data.version_name, None);
         assert_eq!(envelope.data.compile_sdk_version, None);
         assert_eq!(envelope.data.channel, "manifest_channel");
-        assert_eq!(envelope.data.permissions, vec!["android.permission.INTERNET"]);
+        assert_eq!(
+            envelope.data.permissions,
+            vec!["android.permission.INTERNET"]
+        );
         assert!(!envelope.data.icon_url.is_empty());
     }
 
@@ -1988,12 +2642,10 @@ mod tests {
         let envelope = parse_apk_to_envelope(&apk);
         assert!(envelope.success);
         assert_eq!(envelope.data.app_name, "Demo App");
-        assert!(
-            !envelope
-                .warnings
-                .iter()
-                .any(|w| w == super::warnings::APP_NAME_UNRESOLVED)
-        );
+        assert!(!envelope
+            .warnings
+            .iter()
+            .any(|w| w == super::warnings::APP_NAME_UNRESOLVED));
     }
 
     #[test]
@@ -2001,7 +2653,8 @@ mod tests {
         let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android">
             <application android:label="@com.demo.app:string/app_name" />
         </manifest>"#;
-        let strings = r#"<resources><string name="app_name">Demo App From Prefix</string></resources>"#;
+        let strings =
+            r#"<resources><string name="app_name">Demo App From Prefix</string></resources>"#;
         let apk = build_zip_with_name(
             "demo-prefix.apk",
             vec![
@@ -2020,7 +2673,8 @@ mod tests {
         let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android">
             <application android:label="@0x7f010000" />
         </manifest>"#;
-        let strings = r#"<resources><string name="app_name">Demo App Resource Id</string></resources>"#;
+        let strings =
+            r#"<resources><string name="app_name">Demo App Resource Id</string></resources>"#;
         let arsc = build_minimal_arsc("string", 1, "app_name");
         let apk = build_zip_with_name(
             "demo-resource-id.apk",
@@ -2041,9 +2695,11 @@ mod tests {
         let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android">
             <application android:label="@string/app_name" />
         </manifest>"#;
-        let default_strings = r#"<resources><string name="app_name">Default App</string></resources>"#;
+        let default_strings =
+            r#"<resources><string name="app_name">Default App</string></resources>"#;
         let zh_strings = r#"<resources><string name="app_name">中文应用</string></resources>"#;
-        let zh_rcn_strings = r#"<resources><string name="app_name">中文应用（中国）</string></resources>"#;
+        let zh_rcn_strings =
+            r#"<resources><string name="app_name">中文应用（中国）</string></resources>"#;
         let apk = build_zip_with_name(
             "demo-locale.apk",
             vec![
@@ -2079,12 +2735,10 @@ mod tests {
         let envelope = parse_apk_to_envelope(&apk);
         assert!(envelope.success);
         assert_eq!(envelope.data.app_name, "Indirect Name");
-        assert!(
-            envelope
-                .warnings
-                .iter()
-                .any(|w| w == super::warnings::APP_NAME_PICKED_STRING_REF)
-        );
+        assert!(envelope
+            .warnings
+            .iter()
+            .any(|w| w == super::warnings::APP_NAME_PICKED_STRING_REF));
     }
 
     #[test]
@@ -2106,12 +2760,10 @@ mod tests {
 
         let envelope = parse_apk_to_envelope(&apk);
         assert!(envelope.success);
-        assert!(
-            envelope
-                .warnings
-                .iter()
-                .any(|w| w == super::warnings::APP_NAME_UNRESOLVED)
-        );
+        assert!(envelope
+            .warnings
+            .iter()
+            .any(|w| w == super::warnings::APP_NAME_UNRESOLVED));
     }
 
     #[test]
@@ -2139,17 +2791,18 @@ mod tests {
     fn unknown_channel_sets_warning() {
         let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android"></manifest>"#;
 
-        let apk = build_zip_with_name("demo-release.apk", vec![("AndroidManifest.xml", manifest.as_bytes())]);
+        let apk = build_zip_with_name(
+            "demo-release.apk",
+            vec![("AndroidManifest.xml", manifest.as_bytes())],
+        );
         let envelope = parse_apk_to_envelope(&apk);
 
         assert!(envelope.success);
         assert_eq!(envelope.data.channel, "unknown");
-        assert!(
-            envelope
-                .warnings
-                .iter()
-                .any(|w| w == super::warnings::CHANNEL_NOT_FOUND)
-        );
+        assert!(envelope
+            .warnings
+            .iter()
+            .any(|w| w == super::warnings::CHANNEL_NOT_FOUND));
     }
 
     #[test]
@@ -2169,12 +2822,10 @@ mod tests {
         let envelope = parse_apk_to_envelope(&apk);
         assert!(envelope.success);
         assert!(envelope.data.icon_url.ends_with(".webp"));
-        assert!(
-            envelope
-                .warnings
-                .iter()
-                .any(|item| item == "ICON_PICKED_MANIFEST_PATH")
-        );
+        assert!(envelope
+            .warnings
+            .iter()
+            .any(|item| item == "ICON_PICKED_MANIFEST_PATH"));
     }
 
     #[test]
@@ -2194,12 +2845,10 @@ mod tests {
         let envelope = parse_apk_to_envelope(&apk);
         assert!(envelope.success);
         assert!(envelope.data.icon_url.contains("png"));
-        assert!(
-            envelope
-                .warnings
-                .iter()
-                .any(|item| item == "ICON_PICKED_ROUND_ICON")
-        );
+        assert!(envelope
+            .warnings
+            .iter()
+            .any(|item| item == "ICON_PICKED_ROUND_ICON"));
     }
 
     #[test]
@@ -2219,12 +2868,10 @@ mod tests {
         let envelope = parse_apk_to_envelope(&apk);
         assert!(envelope.success);
         assert!(envelope.data.icon_url.ends_with(".png"));
-        assert!(
-            envelope
-                .warnings
-                .iter()
-                .any(|item| item == "ICON_PICKED_MANIFEST_PATH")
-        );
+        assert!(envelope
+            .warnings
+            .iter()
+            .any(|item| item == "ICON_PICKED_MANIFEST_PATH"));
     }
 
     #[test]
@@ -2275,7 +2922,10 @@ mod tests {
     #[test]
     fn envelope_json_contract_keys_exist() {
         let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android"></manifest>"#;
-        let apk = build_zip_with_name("demo.apk", vec![("AndroidManifest.xml", manifest.as_bytes())]);
+        let apk = build_zip_with_name(
+            "demo.apk",
+            vec![("AndroidManifest.xml", manifest.as_bytes())],
+        );
         let envelope = parse_apk_to_envelope(&apk);
 
         let json = serde_json::to_value(&envelope).expect("serialize envelope");
@@ -2315,7 +2965,10 @@ mod tests {
     #[test]
     fn tauri_and_direct_parser_are_consistent() {
         let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android"></manifest>"#;
-        let apk = build_zip_with_name("demo.apk", vec![("AndroidManifest.xml", manifest.as_bytes())]);
+        let apk = build_zip_with_name(
+            "demo.apk",
+            vec![("AndroidManifest.xml", manifest.as_bytes())],
+        );
 
         let direct = parse_apk_to_envelope(&apk);
         let tauri = parse_apk_tauri(apk.to_string_lossy().to_string());
@@ -2443,8 +3096,10 @@ mod tests {
         let package_header_size = 288u16;
         let type_strings_offset = package_header_size as u32;
         let key_strings_offset = type_strings_offset + type_strings.len() as u32;
-        let package_size =
-            package_header_size as usize + type_strings.len() + key_strings.len() + type_chunk.len();
+        let package_size = package_header_size as usize
+            + type_strings.len()
+            + key_strings.len()
+            + type_chunk.len();
 
         let mut package_chunk = Vec::new();
         push_u16(&mut package_chunk, 0x0200);

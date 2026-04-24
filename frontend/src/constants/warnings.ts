@@ -1,4 +1,6 @@
 ﻿export const WARNING_LABELS: Record<string, string> = {
+  AAPT_NOT_FOUND_FALLBACK_USED: "未找到 aapt，已使用内置解析兜底",
+  AAPT_BADGING_FAILED_FALLBACK_USED: "aapt 解析失败，已使用内置解析兜底",
   CHANNEL_NOT_FOUND: "未检测到渠道信息",
   ICON_NOT_FOUND: "未找到可提取图标",
   ICON_MANIFEST_REF_UNRESOLVED: "Manifest 图标引用未能解析到资源文件",
@@ -10,8 +12,11 @@
   ICON_PICKED_RESOURCE_ID_ARSC: "图标来源：resources.arsc 反查",
   ICON_PICKED_ADAPTIVE_XML: "图标来源：Adaptive XML 图层",
   ICON_PICKED_HEURISTIC_FALLBACK: "图标来源：启发式兜底",
+  ICON_PICKED_AAPT_BADGING: "图标来源：aapt badging",
+  ICON_PICKED_AAPT_XMLTREE: "图标来源：aapt xmltree",
   APP_NAME_PICKED_STRING_REF: "应用名来源：字符串资源引用",
   APP_NAME_PICKED_RESOURCE_ID: "应用名来源：resources.arsc 反查",
+  APP_NAME_PICKED_AAPT_LABEL: "应用名来源：aapt label",
   APP_NAME_UNRESOLVED: "应用名资源未能解析",
   SIGNATURE_PARTIAL: "签名信息为尽力解析，可能不完整",
   SIGNATURE_BLOCK_DETECTED_UNPARSED: "检测到 APK 签名块，但未完成完整解析",

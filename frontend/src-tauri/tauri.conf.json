@@ -21,6 +21,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "icon": ["icons/icon.ico"]
+    "icon": ["icons/icon.ico"],
+    "resources": {
+      "../../tools/android/*": "tools/android/"
+    }
   }
 }

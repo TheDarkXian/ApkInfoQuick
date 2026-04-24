@@ -1,6 +1,7 @@
 use apk_info_backend::model::ApkInfoEnvelope;
 use apk_info_backend::parser::parse_apk_tauri;
 use base64::Engine;
+use tauri::{path::BaseDirectory, Manager};
 
 #[tauri::command]
 fn parse_apk(file_path: String) -> ApkInfoEnvelope {
@@ -32,7 +33,10 @@ fn read_icon_data_url(file_path: String) -> Option<String> {
 }
 
 #[tauri::command]
-fn export_icon_with_dialog(source_file_path: String, suggested_file_name: String) -> Result<Option<String>, String> {
+fn export_icon_with_dialog(
+    source_file_path: String,
+    suggested_file_name: String,
+) -> Result<Option<String>, String> {
     let extension = std::path::Path::new(&source_file_path)
         .extension()
         .and_then(|ext| ext.to_str())
@@ -54,8 +58,25 @@ fn export_icon_with_dialog(source_file_path: String, suggested_file_name: String
     Ok(Some(target_path.to_string_lossy().to_string()))
 }
 
+fn configure_bundled_aapt(app: &tauri::App) {
+    let Ok(path) = app
+        .path()
+        .resolve("tools/android/aapt.exe", BaseDirectory::Resource)
+    else {
+        return;
+    };
+
+    if path.is_file() {
+        std::env::set_var("APK_INFO_AAPT", path);
+    }
+}
+
 fn main() {
     tauri::Builder::default()
+        .setup(|app| {
+            configure_bundled_aapt(app);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             parse_apk,
             pick_files,
