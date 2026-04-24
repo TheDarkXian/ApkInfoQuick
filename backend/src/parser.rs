@@ -549,7 +549,7 @@ mod resource_resolver {
             return;
         }
 
-        if let Some(key) = label.strip_prefix("@string/") {
+        if let Some(key) = extract_string_key(&label) {
             if let Some(v) = read_string_resource(archive, key) {
                 manifest.app_name = Some(v);
                 return;
@@ -558,6 +558,23 @@ mod resource_resolver {
 
         manifest.app_name = None;
         super::push_warning(warnings, super::warnings::APP_NAME_UNRESOLVED);
+    }
+
+    fn extract_string_key(label: &str) -> Option<&str> {
+        if let Some(key) = label.strip_prefix("@string/") {
+            return Some(key);
+        }
+
+        if let Some(raw) = label.strip_prefix('@') {
+            if let Some((_, key)) = raw.rsplit_once(":string/") {
+                return Some(key);
+            }
+            if let Some(key) = raw.strip_prefix("string/") {
+                return Some(key);
+            }
+        }
+
+        None
     }
 
     fn read_string_resource(archive: &mut ZipArchive<File>, key: &str) -> Option<String> {
@@ -626,6 +643,7 @@ mod icon_extractor {
     const ICON_DENSITY_PRIORITY: [&str; 10] = [
         "xxxhdpi", "xxhdpi", "xhdpi", "hdpi", "mdpi", "ldpi", "anydpi", "tvdpi", "nodpi", "",
     ];
+    const ICON_EXT_PRIORITY: [&str; 2] = ["png", "webp"];
 
     pub fn extract_best_icon(
         apk_path: &Path,
@@ -682,9 +700,11 @@ mod icon_extractor {
             } else {
                 format!("{icon_type}-{density}")
             };
-            let candidate = format!("res/{qualifier}/{icon_name}.png");
-            if entries.iter().any(|e| e == &candidate) {
-                out.push(candidate);
+            for ext in ICON_EXT_PRIORITY {
+                let candidate = format!("res/{qualifier}/{icon_name}.{ext}");
+                if entries.iter().any(|e| e == &candidate) {
+                    out.push(candidate);
+                }
             }
         }
 
@@ -701,9 +721,11 @@ mod icon_extractor {
                     format!("{base}-{density}")
                 };
                 for name in ["ic_launcher", "app_icon", "icon"] {
-                    let p = format!("res/{dir}/{name}.png");
-                    if entries.iter().any(|e| e == &p) {
-                        out.push(p.clone());
+                    for ext in ICON_EXT_PRIORITY {
+                        let p = format!("res/{dir}/{name}.{ext}");
+                        if entries.iter().any(|e| e == &p) {
+                            out.push(p.clone());
+                        }
                     }
                 }
             }
@@ -711,7 +733,7 @@ mod icon_extractor {
         if out.is_empty() {
             for entry in entries {
                 if (entry.starts_with("res/mipmap") || entry.starts_with("res/drawable"))
-                    && entry.ends_with(".png")
+                    && (entry.ends_with(".png") || entry.ends_with(".webp"))
                 {
                     out.push(entry.clone());
                 }
@@ -736,7 +758,11 @@ mod icon_extractor {
 
         let digest = Sha256::digest(entry_name.as_bytes());
         let suffix = format!("{:x}", digest);
-        let filename = format!("{stem}-{}.png", &suffix[..12]);
+        let ext = Path::new(entry_name)
+            .extension()
+            .and_then(OsStr::to_str)
+            .unwrap_or("png");
+        let filename = format!("{stem}-{}.{}", &suffix[..12], ext);
         let target = dir.join(filename);
         std::fs::write(&target, bytes).ok()?;
 
@@ -1068,6 +1094,25 @@ mod tests {
     }
 
     #[test]
+    fn app_name_from_prefixed_string_reference_is_resolved() {
+        let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="@com.demo.app:string/app_name" />
+        </manifest>"#;
+        let strings = r#"<resources><string name="app_name">Demo App From Prefix</string></resources>"#;
+        let apk = build_zip_with_name(
+            "demo-prefix.apk",
+            vec![
+                ("AndroidManifest.xml", manifest.as_bytes()),
+                ("res/values/strings.xml", strings.as_bytes()),
+            ],
+        );
+
+        let envelope = parse_apk_to_envelope(&apk);
+        assert!(envelope.success);
+        assert_eq!(envelope.data.app_name, "Demo App From Prefix");
+    }
+
+    #[test]
     fn unknown_channel_sets_warning() {
         let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android"></manifest>"#;
 
@@ -1082,6 +1127,25 @@ mod tests {
                 .iter()
                 .any(|w| w == super::warnings::CHANNEL_NOT_FOUND)
         );
+    }
+
+    #[test]
+    fn webp_icon_can_be_extracted() {
+        let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:icon="@mipmap/ic_launcher" />
+        </manifest>"#;
+
+        let apk = build_zip_with_name(
+            "icon-webp.apk",
+            vec![
+                ("AndroidManifest.xml", manifest.as_bytes()),
+                ("res/mipmap-xxhdpi/ic_launcher.webp", b"webp"),
+            ],
+        );
+
+        let envelope = parse_apk_to_envelope(&apk);
+        assert!(envelope.success);
+        assert!(envelope.data.icon_url.ends_with(".webp"));
     }
 
     #[test]
