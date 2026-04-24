@@ -1,0 +1,35 @@
+# Copy Text Template (Current Tab)
+# Placeholder format: #field#
+# Lines starting with "#" are comments and should be ignored by parser.
+
+FileName: #file_name#
+FilePath: #path#
+Ext: #ext#
+Status: #status#
+
+PackageName: #packname#
+ProductName: #product_name#
+AppName: #app_name#
+Channel: #channel#
+
+MinSdkVersion: #min_sdk_version#
+TargetSdkVersion: #target_sdk_version#
+CompileSdkVersion: #compile_sdk_version#
+VersionCode: #version_code#
+VersionName: #version_name#
+
+Permissions:
+#permissions#
+
+ABIs:
+#abis#
+
+Signers:
+#signers#
+
+Warnings:
+#warnings#
+
+ErrorCode: #error_code#
+ErrorMessage: #error_message#
+
