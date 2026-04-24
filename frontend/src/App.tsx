@@ -7,6 +7,8 @@ import DeleteSweepIcon from "@mui/icons-material/DeleteSweep";
 import FilterAltOffIcon from "@mui/icons-material/FilterAltOff";
 import HighlightOffIcon from "@mui/icons-material/HighlightOff";
 import DownloadIcon from "@mui/icons-material/Download";
+import ExpandLessIcon from "@mui/icons-material/ExpandLess";
+import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
 import ImageNotSupportedIcon from "@mui/icons-material/ImageNotSupported";
 import HourglassTopIcon from "@mui/icons-material/HourglassTop";
 import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
@@ -42,6 +44,15 @@ const EMPTY_TEXT = "无数据";
 const MAX_TABS = 10;
 const SECTION_PADDING = 0.72;
 const COMPACT_LIST_ITEM_SX = { py: 0.02, minHeight: 22 };
+const DIAGNOSTIC_WARNING_CODES = new Set([
+  "ICON_MANIFEST_REF_UNRESOLVED",
+  "ICON_RESOURCE_ID_UNRESOLVED",
+  "ICON_ADAPTIVE_XML_UNRESOLVED",
+  "ICON_CANDIDATES_EMPTY",
+  "APP_NAME_UNRESOLVED",
+  "SIGNATURE_PARTIAL",
+  "SIGNATURE_BLOCK_DETECTED_UNPARSED"
+]);
 
 type ToastSeverity = "success" | "info" | "warning" | "error";
 
@@ -63,6 +74,8 @@ function App() {
     severity: "info"
   });
   const [resolvedIconUrl, setResolvedIconUrl] = useState("");
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [signerExpanded, setSignerExpanded] = useState(false);
   const tabsRef = useRef<FileTab[]>([]);
 
   const activeTab = useMemo(
@@ -363,7 +376,22 @@ function App() {
     activeTab?.envelope?.warnings.includes("SIGNATURE_BLOCK_DETECTED_UNPARSED");
   const allWarnings = activeTab?.envelope?.warnings ?? [];
   const iconPickedWarning = allWarnings.find((item) => isIconPickedWarning(item)) ?? "";
-  const displayWarnings = allWarnings.filter((item) => !isIconPickedWarning(item));
+  const iconResolvedSuccessfully = Boolean(rawIconUrl && resolvedIconUrl);
+  const diagnosticWarnings = allWarnings.filter((item) => {
+    if (isIconPickedWarning(item)) {
+      return false;
+    }
+    if (!DIAGNOSTIC_WARNING_CODES.has(item)) {
+      return false;
+    }
+    if (!item.startsWith("ICON_")) {
+      return true;
+    }
+    return iconResolvedSuccessfully;
+  });
+  const primaryWarnings = allWarnings.filter((item) => !isIconPickedWarning(item) && !diagnosticWarnings.includes(item));
+  const signerDefaultExpanded =
+    Boolean(activeData && activeData.signers.length > 0) && !hasSignaturePartialRisk;
 
   useEffect(() => {
     let active = true;
@@ -407,6 +435,11 @@ function App() {
       active = false;
     };
   }, [rawIconUrl]);
+
+  useEffect(() => {
+    setShowDiagnostics(false);
+    setSignerExpanded(signerDefaultExpanded);
+  }, [activeTabId, signerDefaultExpanded]);
 
   return (
     <Container maxWidth={false} sx={{ py: 0.75, px: 1 }}>
@@ -645,9 +678,9 @@ function App() {
                         <Typography variant="caption" color="text.secondary">
                           警告
                         </Typography>
-                        {displayWarnings.length ? (
+                        {primaryWarnings.length ? (
                           <Stack direction="row" spacing={0.45} useFlexGap flexWrap="wrap">
-                            {displayWarnings.map((warning) => (
+                            {primaryWarnings.map((warning) => (
                               <Tooltip key={warning} title={warning}>
                                 <Chip size="small" label={toWarningLabel(warning)} color="warning" variant="outlined" />
                               </Tooltip>
@@ -657,6 +690,33 @@ function App() {
                           <Typography variant="body2" color="text.secondary">
                             {EMPTY_TEXT}
                           </Typography>
+                        )}
+                        {diagnosticWarnings.length > 0 && (
+                          <>
+                            <Divider />
+                            <Stack direction="row" justifyContent="space-between" alignItems="center">
+                              <Typography variant="caption" color="text.secondary">
+                                详细诊断（{diagnosticWarnings.length}）
+                              </Typography>
+                              <Button
+                                size="small"
+                                variant="text"
+                                onClick={() => setShowDiagnostics((prev) => !prev)}
+                                endIcon={showDiagnostics ? <ExpandLessIcon fontSize="small" /> : <ExpandMoreIcon fontSize="small" />}
+                              >
+                                {showDiagnostics ? "收起" : "展开"}
+                              </Button>
+                            </Stack>
+                            {showDiagnostics && (
+                              <Stack direction="row" spacing={0.45} useFlexGap flexWrap="wrap">
+                                {diagnosticWarnings.map((warning) => (
+                                  <Tooltip key={warning} title={warning}>
+                                    <Chip size="small" label={toWarningLabel(warning)} color="default" variant="outlined" />
+                                  </Tooltip>
+                                ))}
+                              </Stack>
+                            )}
+                          </>
                         )}
                       </Stack>
                     </Paper>
@@ -685,44 +745,61 @@ function App() {
 
                   <Box sx={{ gridColumn: { xs: "span 2", lg: "span 6" }, minWidth: 0 }}>
                     <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
-                      <Typography variant="caption" sx={{ fontWeight: 700 }}>
-                        签名信息
-                      </Typography>
-                      {hasSignaturePartialRisk && (
-                        <Alert severity="warning" sx={{ mt: 0.45, mb: 0.6, py: 0 }}>
-                          当前签名信息为尽力解析，部分证书元数据可能不完整。
-                        </Alert>
-                      )}
-                      {activeData.signers.length === 0 ? (
-                        <Typography variant="body2" color="text.secondary">
-                          {EMPTY_TEXT}
+                      <Stack direction="row" justifyContent="space-between" alignItems="center">
+                        <Typography variant="caption" sx={{ fontWeight: 700 }}>
+                          签名信息
                         </Typography>
-                      ) : (
-                        <Stack spacing={0.55}>
-                          {activeData.signers.map((signer, index) => (
-                            <Paper key={`${signer.certSha256}-${index}`} variant="outlined" sx={{ p: 0.5 }}>
-                              <Typography variant="caption" sx={{ fontWeight: 600 }}>
-                                签名者 #{index + 1}
-                              </Typography>
-                              <List dense sx={{ py: 0 }}>
-                                <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                                  <ListItemText primary="scheme" secondary={signer.scheme || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
-                                </ListItem>
-                                <Divider component="li" />
-                                <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                                  <ListItemText primary="certSha256" secondary={signer.certSha256 || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
-                                </ListItem>
-                                <Divider component="li" />
-                                <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                                  <ListItemText primary="issuer" secondary={signer.issuer || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
-                                </ListItem>
-                                <Divider component="li" />
-                                <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                                  <ListItemText primary="subject" secondary={signer.subject || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
-                                </ListItem>
-                              </List>
-                            </Paper>
-                          ))}
+                        <Button
+                          size="small"
+                          variant="text"
+                          onClick={() => setSignerExpanded((prev) => !prev)}
+                          endIcon={signerExpanded ? <ExpandLessIcon fontSize="small" /> : <ExpandMoreIcon fontSize="small" />}
+                        >
+                          {signerExpanded ? "收起" : "展开"}
+                        </Button>
+                      </Stack>
+                      <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.35 }}>
+                        {activeData.signers.length === 0 ? "签名：无可用信息" : hasSignaturePartialRisk ? "签名：解析不完整" : `签名：${activeData.signers.length} 个`}
+                      </Typography>
+                      {signerExpanded && (
+                        <Stack spacing={0.55} sx={{ mt: 0.45 }}>
+                          {hasSignaturePartialRisk && (
+                            <Alert severity="warning" sx={{ mb: 0.3, py: 0 }}>
+                              当前签名信息为尽力解析，部分证书元数据可能不完整。
+                            </Alert>
+                          )}
+                          {activeData.signers.length === 0 ? (
+                            <Typography variant="body2" color="text.secondary">
+                              {EMPTY_TEXT}
+                            </Typography>
+                          ) : (
+                            <Stack spacing={0.55}>
+                              {activeData.signers.map((signer, index) => (
+                                <Paper key={`${signer.certSha256}-${index}`} variant="outlined" sx={{ p: 0.5 }}>
+                                  <Typography variant="caption" sx={{ fontWeight: 600 }}>
+                                    签名者 #{index + 1}
+                                  </Typography>
+                                  <List dense sx={{ py: 0 }}>
+                                    <ListItem sx={COMPACT_LIST_ITEM_SX}>
+                                      <ListItemText primary="scheme" secondary={signer.scheme || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
+                                    </ListItem>
+                                    <Divider component="li" />
+                                    <ListItem sx={COMPACT_LIST_ITEM_SX}>
+                                      <ListItemText primary="certSha256" secondary={signer.certSha256 || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
+                                    </ListItem>
+                                    <Divider component="li" />
+                                    <ListItem sx={COMPACT_LIST_ITEM_SX}>
+                                      <ListItemText primary="issuer" secondary={signer.issuer || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
+                                    </ListItem>
+                                    <Divider component="li" />
+                                    <ListItem sx={COMPACT_LIST_ITEM_SX}>
+                                      <ListItemText primary="subject" secondary={signer.subject || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
+                                    </ListItem>
+                                  </List>
+                                </Paper>
+                              ))}
+                            </Stack>
+                          )}
                         </Stack>
                       )}
                     </Paper>

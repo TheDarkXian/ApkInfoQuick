@@ -20,6 +20,8 @@ describe("warning labels", () => {
     expect(Object.keys(WARNING_LABELS).sort()).toEqual(
       [
         "APP_NAME_UNRESOLVED",
+        "APP_NAME_PICKED_RESOURCE_ID",
+        "APP_NAME_PICKED_STRING_REF",
         "CHANNEL_NOT_FOUND",
         "ICON_ADAPTIVE_XML_UNRESOLVED",
         "ICON_CANDIDATES_EMPTY",

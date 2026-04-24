@@ -63,6 +63,8 @@ mod warnings {
     pub const ICON_ADAPTIVE_XML_UNRESOLVED: &str = "ICON_ADAPTIVE_XML_UNRESOLVED";
     pub const ICON_CANDIDATES_EMPTY: &str = "ICON_CANDIDATES_EMPTY";
     pub const APP_NAME_UNRESOLVED: &str = "APP_NAME_UNRESOLVED";
+    pub const APP_NAME_PICKED_STRING_REF: &str = "APP_NAME_PICKED_STRING_REF";
+    pub const APP_NAME_PICKED_RESOURCE_ID: &str = "APP_NAME_PICKED_RESOURCE_ID";
     pub const SIGNATURE_PARTIAL: &str = "SIGNATURE_PARTIAL";
     pub const SIGNATURE_BLOCK_DETECTED_UNPARSED: &str = "SIGNATURE_BLOCK_DETECTED_UNPARSED";
     pub const MANIFEST_BINARY_PARTIAL: &str = "MANIFEST_BINARY_PARTIAL";
@@ -554,6 +556,7 @@ mod resource_resolver {
     const RES_TABLE_PACKAGE_TYPE: u16 = 0x0200;
     const RES_TABLE_TYPE_TYPE: u16 = 0x0201;
 
+    #[derive(Debug, Clone)]
     enum AppLabelRef {
         StringKey(String),
         ResourceId(u32),
@@ -573,8 +576,16 @@ mod resource_resolver {
         }
 
         if let Some(label_ref) = parse_label_ref(&label) {
-            if let Some(v) = resolve_from_label_ref(archive, label_ref) {
+            let mut visited = BTreeSet::new();
+            if let Some(v) = resolve_from_label_ref(archive, &label_ref, 0, &mut visited) {
                 manifest.app_name = Some(v);
+                super::push_warning(
+                    warnings,
+                    match label_ref {
+                        AppLabelRef::StringKey(_) => super::warnings::APP_NAME_PICKED_STRING_REF,
+                        AppLabelRef::ResourceId(_) => super::warnings::APP_NAME_PICKED_RESOURCE_ID,
+                    },
+                );
                 return;
             }
         }
@@ -608,21 +619,47 @@ mod resource_resolver {
 
     fn resolve_from_label_ref(
         archive: &mut ZipArchive<File>,
-        label_ref: AppLabelRef,
+        label_ref: &AppLabelRef,
+        depth: usize,
+        visited: &mut BTreeSet<String>,
     ) -> Option<String> {
+        if depth > 4 {
+            return None;
+        }
+
         match label_ref {
-            AppLabelRef::StringKey(key) => read_string_resource(archive, &key),
-            AppLabelRef::ResourceId(resource_id) => {
-                let (resource_type, key) = resolve_resource_id_from_arsc(archive, resource_id)?;
-                if resource_type != "string" {
+            AppLabelRef::StringKey(key) => {
+                let marker = format!("string:{key}");
+                if !visited.insert(marker.clone()) {
                     return None;
                 }
-                read_string_resource(archive, &key)
+                let result = read_string_resource(archive, key, depth, visited);
+                visited.remove(&marker);
+                result
+            }
+            AppLabelRef::ResourceId(resource_id) => {
+                let marker = format!("resid:{resource_id:08x}");
+                if !visited.insert(marker.clone()) {
+                    return None;
+                }
+                let (resource_type, key) = resolve_resource_id_from_arsc(archive, *resource_id)?;
+                if resource_type != "string" {
+                    visited.remove(&marker);
+                    return None;
+                }
+                let result = read_string_resource(archive, &key, depth + 1, visited);
+                visited.remove(&marker);
+                result
             }
         }
     }
 
-    fn read_string_resource(archive: &mut ZipArchive<File>, key: &str) -> Option<String> {
+    fn read_string_resource(
+        archive: &mut ZipArchive<File>,
+        key: &str,
+        depth: usize,
+        visited: &mut BTreeSet<String>,
+    ) -> Option<String> {
         let mut candidates = archive_reader::list_entries(archive)
             .into_iter()
             .filter(|name| {
@@ -635,16 +672,38 @@ mod resource_resolver {
                 file_name.starts_with("strings") && file_name.ends_with(".xml")
             })
             .collect::<Vec<_>>();
-        candidates.sort_by(|a, b| string_file_priority(b).cmp(&string_file_priority(a)));
+        candidates.sort_by(|a, b| {
+            string_file_priority(b)
+                .cmp(&string_file_priority(a))
+                .then_with(|| a.cmp(b))
+        });
 
         for path in candidates {
-            if let Ok(mut entry) = archive.by_name(&path) {
-                let mut content = String::new();
-                if entry.read_to_string(&mut content).is_ok() {
-                    if let Some(v) = find_string_in_xml(&content, key) {
-                        return Some(v);
-                    }
+            let mut content = String::new();
+            let read_ok = {
+                if let Ok(mut entry) = archive.by_name(&path) {
+                    entry.read_to_string(&mut content).is_ok()
+                } else {
+                    false
                 }
+            };
+            if !read_ok {
+                continue;
+            }
+            if let Some(v) = find_string_in_xml(&content, key) {
+                let normalized = v.trim();
+                if normalized.is_empty() {
+                    continue;
+                }
+                if let Some(next_ref) = parse_label_ref(normalized) {
+                    if let Some(resolved) =
+                        resolve_from_label_ref(archive, &next_ref, depth + 1, visited)
+                    {
+                        return Some(resolved);
+                    }
+                    continue;
+                }
+                return Some(normalized.to_string());
             }
         }
         None
@@ -1998,6 +2057,82 @@ mod tests {
         let envelope = parse_apk_to_envelope(&apk);
         assert!(envelope.success);
         assert_eq!(envelope.data.app_name, "中文应用（中国）");
+    }
+
+    #[test]
+    fn app_name_indirect_string_reference_is_resolved() {
+        let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="@string/app_name" />
+        </manifest>"#;
+        let strings = r#"<resources>
+            <string name="app_name">@string/app_name_real</string>
+            <string name="app_name_real">Indirect Name</string>
+        </resources>"#;
+        let apk = build_zip_with_name(
+            "demo-indirect.apk",
+            vec![
+                ("AndroidManifest.xml", manifest.as_bytes()),
+                ("res/values/strings.xml", strings.as_bytes()),
+            ],
+        );
+
+        let envelope = parse_apk_to_envelope(&apk);
+        assert!(envelope.success);
+        assert_eq!(envelope.data.app_name, "Indirect Name");
+        assert!(
+            envelope
+                .warnings
+                .iter()
+                .any(|w| w == super::warnings::APP_NAME_PICKED_STRING_REF)
+        );
+    }
+
+    #[test]
+    fn app_name_indirect_cycle_does_not_loop_and_falls_back() {
+        let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="@string/a" />
+        </manifest>"#;
+        let strings = r#"<resources>
+            <string name="a">@string/b</string>
+            <string name="b">@string/a</string>
+        </resources>"#;
+        let apk = build_zip_with_name(
+            "demo-cycle.apk",
+            vec![
+                ("AndroidManifest.xml", manifest.as_bytes()),
+                ("res/values/strings.xml", strings.as_bytes()),
+            ],
+        );
+
+        let envelope = parse_apk_to_envelope(&apk);
+        assert!(envelope.success);
+        assert!(
+            envelope
+                .warnings
+                .iter()
+                .any(|w| w == super::warnings::APP_NAME_UNRESOLVED)
+        );
+    }
+
+    #[test]
+    fn app_name_blank_value_is_skipped_and_fallback_locale_is_used() {
+        let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="@string/app_name" />
+        </manifest>"#;
+        let zh_rcn_strings = r#"<resources><string name="app_name">   </string></resources>"#;
+        let zh_strings = r#"<resources><string name="app_name">中文名称</string></resources>"#;
+        let apk = build_zip_with_name(
+            "demo-blank-locale.apk",
+            vec![
+                ("AndroidManifest.xml", manifest.as_bytes()),
+                ("res/values-zh-rCN/strings.xml", zh_rcn_strings.as_bytes()),
+                ("res/values-zh/strings.xml", zh_strings.as_bytes()),
+            ],
+        );
+
+        let envelope = parse_apk_to_envelope(&apk);
+        assert!(envelope.success);
+        assert_eq!(envelope.data.app_name, "中文名称");
     }
 
     #[test]

@@ -10,6 +10,8 @@
   ICON_PICKED_RESOURCE_ID_ARSC: "图标来源：resources.arsc 反查",
   ICON_PICKED_ADAPTIVE_XML: "图标来源：Adaptive XML 图层",
   ICON_PICKED_HEURISTIC_FALLBACK: "图标来源：启发式兜底",
+  APP_NAME_PICKED_STRING_REF: "应用名来源：字符串资源引用",
+  APP_NAME_PICKED_RESOURCE_ID: "应用名来源：resources.arsc 反查",
   APP_NAME_UNRESOLVED: "应用名资源未能解析",
   SIGNATURE_PARTIAL: "签名信息为尽力解析，可能不完整",
   SIGNATURE_BLOCK_DETECTED_UNPARSED: "检测到 APK 签名块，但未完成完整解析",
@@ -19,6 +21,9 @@
 export function toWarningLabel(code: string): string {
   if (code.startsWith("ICON_PICKED_")) {
     return WARNING_LABELS[code] ?? `图标来源：${code.replace("ICON_PICKED_", "")}`;
+  }
+  if (code.startsWith("APP_NAME_PICKED_")) {
+    return WARNING_LABELS[code] ?? `应用名来源：${code.replace("APP_NAME_PICKED_", "")}`;
   }
   return WARNING_LABELS[code] ?? `未知警告（${code}）`;
 }
