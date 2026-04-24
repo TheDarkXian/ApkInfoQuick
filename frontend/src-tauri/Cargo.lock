@@ -126,6 +126,7 @@ name = "apk_info_quick_tauri"
 version = "0.1.0"
 dependencies = [
  "apk_info_backend",
+ "base64 0.22.1",
  "rfd",
  "tauri",
  "tauri-build",

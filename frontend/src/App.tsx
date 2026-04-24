@@ -1,5 +1,4 @@
 ﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import CloudUploadIcon from "@mui/icons-material/CloudUpload";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
@@ -33,7 +32,7 @@ import {
   Tooltip,
   Typography
 } from "@mui/material";
-import { parseApk, pickFiles } from "./services/tauri";
+import { parseApk, pickFiles, readIconDataUrl } from "./services/tauri";
 import { toWarningLabel } from "./constants/warnings";
 import { FileTab, TabStatus } from "./types/tab";
 import { renderCopyJson, renderCopyText } from "./utils/copy";
@@ -63,6 +62,7 @@ function App() {
     message: "",
     severity: "info"
   });
+  const [resolvedIconUrl, setResolvedIconUrl] = useState("");
   const tabsRef = useRef<FileTab[]>([]);
 
   const activeTab = useMemo(
@@ -359,23 +359,53 @@ function App() {
 
   const activeData = activeTab?.envelope?.data ?? null;
   const rawIconUrl = activeData?.iconUrl || "";
-  const iconUrl = useMemo(() => {
-    if (!rawIconUrl) {
-      return "";
-    }
-    if (!rawIconUrl.startsWith("file://")) {
-      return rawIconUrl;
-    }
-    try {
-      return convertFileSrc(rawIconUrl);
-    } catch {
-      return rawIconUrl;
-    }
-  }, [rawIconUrl]);
-  const iconAvailable = Boolean(iconUrl);
+  const iconAvailable = Boolean(resolvedIconUrl);
   const hasSignaturePartialRisk =
     activeTab?.envelope?.warnings.includes("SIGNATURE_PARTIAL") ||
     activeTab?.envelope?.warnings.includes("SIGNATURE_BLOCK_DETECTED_UNPARSED");
+
+  useEffect(() => {
+    let active = true;
+
+    async function resolveIcon() {
+      if (!rawIconUrl) {
+        if (active) {
+          setResolvedIconUrl("");
+        }
+        return;
+      }
+
+      if (!rawIconUrl.startsWith("file://")) {
+        if (active) {
+          setResolvedIconUrl(rawIconUrl);
+        }
+        return;
+      }
+
+      try {
+        const filePath = toLocalFilePath(rawIconUrl);
+        if (!filePath) {
+          if (active) {
+            setResolvedIconUrl("");
+          }
+          return;
+        }
+        const dataUrl = await readIconDataUrl(filePath);
+        if (active) {
+          setResolvedIconUrl(dataUrl ?? "");
+        }
+      } catch {
+        if (active) {
+          setResolvedIconUrl("");
+        }
+      }
+    }
+
+    void resolveIcon();
+    return () => {
+      active = false;
+    };
+  }, [rawIconUrl]);
 
   return (
     <Container maxWidth={false} sx={{ py: 0.75, px: 1 }}>
@@ -467,7 +497,7 @@ function App() {
                   {iconAvailable ? (
                     <Box
                       component="img"
-                      src={iconUrl}
+                      src={resolvedIconUrl}
                       alt="icon"
                       sx={{ width: 20, height: 20, borderRadius: 0.8, border: "1px solid", borderColor: "divider" }}
                     />
@@ -475,7 +505,7 @@ function App() {
                     <ImageNotSupportedIcon sx={{ fontSize: 16, color: "text.secondary" }} />
                   )}
                   {iconAvailable && activeTab.ext === "apk" && (
-                    <Button size="small" variant="text" startIcon={<DownloadIcon />} onClick={() => onDownloadIcon(iconUrl, activeTab.name)}>
+                    <Button size="small" variant="text" startIcon={<DownloadIcon />} onClick={() => onDownloadIcon(resolvedIconUrl, activeTab.name)}>
                       导出
                     </Button>
                   )}
@@ -761,6 +791,22 @@ function statusColor(status: TabStatus): "default" | "success" | "warning" | "er
       return "info";
     default:
       return "default";
+  }
+}
+
+function toLocalFilePath(iconUrl: string): string | null {
+  if (!iconUrl.startsWith("file://")) {
+    return null;
+  }
+  try {
+    const parsed = new URL(iconUrl);
+    const decoded = decodeURIComponent(parsed.pathname);
+    if (/^\/[a-zA-Z]:\//.test(decoded)) {
+      return decoded.slice(1);
+    }
+    return decoded;
+  } catch {
+    return null;
   }
 }
 

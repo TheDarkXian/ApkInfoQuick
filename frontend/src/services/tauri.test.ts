@@ -5,6 +5,9 @@ const { invokeMock } = vi.hoisted(() => ({
     if (cmd === "pick_files") {
       return ["D:/tmp/a.apk", "D:/tmp/b.aab", "", "   "] as unknown;
     }
+    if (cmd === "read_icon_data_url") {
+      return "data:image/png;base64,AAAA" as unknown;
+    }
     return {
       success: true,
       data: {
@@ -33,6 +36,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 import { parseApk, pickFiles } from "./tauri";
+import { readIconDataUrl } from "./tauri";
 
 describe("parseApk", () => {
   it("invokes tauri parse command and returns normalized envelope", async () => {
@@ -51,5 +55,14 @@ describe("pickFiles", () => {
     const files = await pickFiles();
     expect(files).toEqual(["D:/tmp/a.apk", "D:/tmp/b.aab"]);
     expect(invokeMock).toHaveBeenCalledWith("pick_files");
+  });
+});
+
+describe("readIconDataUrl", () => {
+  it("returns data url from tauri command", async () => {
+    invokeMock.mockClear();
+    const dataUrl = await readIconDataUrl("D:/tmp/icon.png");
+    expect(dataUrl).toBe("data:image/png;base64,AAAA");
+    expect(invokeMock).toHaveBeenCalledWith("read_icon_data_url", { filePath: "D:/tmp/icon.png" });
   });
 });

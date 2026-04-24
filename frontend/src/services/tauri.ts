@@ -19,3 +19,11 @@ export async function pickFiles(): Promise<string[]> {
   }
   return picked.filter((item) => typeof item === "string" && item.trim().length > 0);
 }
+
+export async function readIconDataUrl(filePath: string): Promise<string | null> {
+  const raw = await invoke<string | null>("read_icon_data_url", { filePath });
+  if (typeof raw !== "string" || !raw.startsWith("data:image/")) {
+    return null;
+  }
+  return raw;
+}

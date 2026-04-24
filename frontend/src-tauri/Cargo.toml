@@ -13,3 +13,4 @@ tauri-build = { version = "2", features = [] }
 apk_info_backend = { path = "../../backend" }
 tauri = { version = "2", features = [] }
 rfd = "0.15"
+base64 = "0.22"
