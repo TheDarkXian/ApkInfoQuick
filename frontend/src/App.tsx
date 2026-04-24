@@ -32,16 +32,16 @@ import {
   Tooltip,
   Typography
 } from "@mui/material";
-import { parseApk, pickFiles, readIconDataUrl } from "./services/tauri";
-import { toWarningLabel } from "./constants/warnings";
+import { exportIconWithDialog, parseApk, pickFiles, readIconDataUrl } from "./services/tauri";
+import { isIconPickedWarning, toWarningLabel } from "./constants/warnings";
 import { FileTab, TabStatus } from "./types/tab";
 import { renderCopyJson, renderCopyText } from "./utils/copy";
 import { createTabsFromPaths, ParseJob } from "./utils/workspace";
 
 const EMPTY_TEXT = "无数据";
 const MAX_TABS = 10;
-const SECTION_PADDING = 0.9;
-const COMPACT_LIST_ITEM_SX = { py: 0.05, minHeight: 24 };
+const SECTION_PADDING = 0.72;
+const COMPACT_LIST_ITEM_SX = { py: 0.02, minHeight: 22 };
 
 type ToastSeverity = "success" | "info" | "warning" | "error";
 
@@ -122,27 +122,25 @@ function App() {
     }
   }
 
-  async function onDownloadIcon(iconUrl: string, fileName: string) {
-    if (!iconUrl) {
+  async function onDownloadIcon(rawIconUrl: string, fileName: string) {
+    const sourceFilePath = toLocalFilePath(rawIconUrl);
+    if (!sourceFilePath) {
+      showToast("当前图标不可导出。", "warning");
       return;
     }
 
     try {
-      const response = await fetch(iconUrl);
-      if (!response.ok) {
-        throw new Error("图标下载失败");
-      }
-      const blob = await response.blob();
-      const objectUrl = URL.createObjectURL(blob);
-      const link = document.createElement("a");
       const fallbackName = fileName.replace(/\.(apk|aab)$/i, "");
-      link.href = objectUrl;
-      link.download = `${fallbackName || "app"}-icon`;
-      link.click();
-      URL.revokeObjectURL(objectUrl);
-      showToast("图标导出成功。", "success");
-    } catch {
-      showToast("图标导出失败。", "error");
+      const ext = sourceFilePath.toLowerCase().endsWith(".webp") ? "webp" : "png";
+      const suggestedFileName = `${fallbackName || "app"}-icon.${ext}`;
+      const savedPath = await exportIconWithDialog(sourceFilePath, suggestedFileName);
+      if (!savedPath) {
+        showToast("已取消导出。", "info");
+        return;
+      }
+      showToast(`图标已导出到：${savedPath}`, "success");
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "图标导出失败。", "error");
     }
   }
 
@@ -363,6 +361,9 @@ function App() {
   const hasSignaturePartialRisk =
     activeTab?.envelope?.warnings.includes("SIGNATURE_PARTIAL") ||
     activeTab?.envelope?.warnings.includes("SIGNATURE_BLOCK_DETECTED_UNPARSED");
+  const allWarnings = activeTab?.envelope?.warnings ?? [];
+  const iconPickedWarning = allWarnings.find((item) => isIconPickedWarning(item)) ?? "";
+  const displayWarnings = allWarnings.filter((item) => !isIconPickedWarning(item));
 
   useEffect(() => {
     let active = true;
@@ -493,19 +494,19 @@ function App() {
                     </Typography>
                   </Tooltip>
                 </Stack>
-                <Stack direction="row" spacing={0.4} alignItems="center">
+                <Stack direction="row" spacing={0.55} alignItems="center">
                   {iconAvailable ? (
                     <Box
                       component="img"
                       src={resolvedIconUrl}
                       alt="icon"
-                      sx={{ width: 20, height: 20, borderRadius: 0.8, border: "1px solid", borderColor: "divider" }}
+                      sx={{ width: 40, height: 40, borderRadius: 1, border: "1px solid", borderColor: "divider", objectFit: "contain" }}
                     />
                   ) : (
-                    <ImageNotSupportedIcon sx={{ fontSize: 16, color: "text.secondary" }} />
+                    <ImageNotSupportedIcon sx={{ fontSize: 24, color: "text.secondary" }} />
                   )}
                   {iconAvailable && activeTab.ext === "apk" && (
-                    <Button size="small" variant="text" startIcon={<DownloadIcon />} onClick={() => onDownloadIcon(resolvedIconUrl, activeTab.name)}>
+                    <Button size="small" variant="outlined" startIcon={<DownloadIcon />} onClick={() => onDownloadIcon(rawIconUrl, activeTab.name)}>
                       导出
                     </Button>
                   )}
@@ -539,10 +540,10 @@ function App() {
                   sx={{
                     display: "grid",
                     gap: 0.55,
-                    gridTemplateColumns: { xs: "repeat(2, minmax(0, 1fr))", md: "repeat(12, minmax(0, 1fr))" }
+                    gridTemplateColumns: { xs: "repeat(2, minmax(0, 1fr))", lg: "repeat(12, minmax(0, 1fr))" }
                   }}
                 >
-                  <Box sx={{ gridColumn: { xs: "span 1", md: "span 4" }, minWidth: 0 }}>
+                  <Box sx={{ gridColumn: { xs: "span 1", lg: "span 4" }, minWidth: 0 }}>
                     <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
                       <Typography variant="caption" sx={{ fontWeight: 700 }}>
                         基础信息
@@ -578,7 +579,7 @@ function App() {
                     </Paper>
                   </Box>
 
-                  <Box sx={{ gridColumn: { xs: "span 1", md: "span 4" }, minWidth: 0 }}>
+                  <Box sx={{ gridColumn: { xs: "span 1", lg: "span 4" }, minWidth: 0 }}>
                     <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
                       <Typography variant="caption" sx={{ fontWeight: 700 }}>
                         版本信息
@@ -607,12 +608,25 @@ function App() {
                     </Paper>
                   </Box>
 
-                  <Box sx={{ gridColumn: { xs: "span 2", md: "span 4" }, minWidth: 0 }}>
+                  <Box sx={{ gridColumn: { xs: "span 2", lg: "span 4" }, minWidth: 0 }}>
                     <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
                       <Typography variant="caption" sx={{ fontWeight: 700 }}>
                         ABI / 警告
                       </Typography>
                       <Stack spacing={0.45} sx={{ mt: 0.4 }}>
+                        <Typography variant="caption" color="text.secondary">
+                          图标来源
+                        </Typography>
+                        {iconPickedWarning ? (
+                          <Tooltip title={iconPickedWarning}>
+                            <Chip size="small" label={toWarningLabel(iconPickedWarning)} color="info" variant="outlined" />
+                          </Tooltip>
+                        ) : (
+                          <Typography variant="body2" color="text.secondary">
+                            {EMPTY_TEXT}
+                          </Typography>
+                        )}
+                        <Divider />
                         <Typography variant="caption" color="text.secondary">
                           ABI
                         </Typography>
@@ -631,9 +645,9 @@ function App() {
                         <Typography variant="caption" color="text.secondary">
                           警告
                         </Typography>
-                        {activeTab.envelope?.warnings.length ? (
+                        {displayWarnings.length ? (
                           <Stack direction="row" spacing={0.45} useFlexGap flexWrap="wrap">
-                            {activeTab.envelope.warnings.map((warning) => (
+                            {displayWarnings.map((warning) => (
                               <Tooltip key={warning} title={warning}>
                                 <Chip size="small" label={toWarningLabel(warning)} color="warning" variant="outlined" />
                               </Tooltip>
@@ -648,7 +662,7 @@ function App() {
                     </Paper>
                   </Box>
 
-                  <Box sx={{ gridColumn: { xs: "span 2", md: "span 6" }, minWidth: 0 }}>
+                  <Box sx={{ gridColumn: { xs: "span 2", lg: "span 6" }, minWidth: 0 }}>
                     <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
                       <Typography variant="caption" sx={{ fontWeight: 700 }}>
                         权限列表
@@ -669,7 +683,7 @@ function App() {
                     </Paper>
                   </Box>
 
-                  <Box sx={{ gridColumn: { xs: "span 2", md: "span 6" }, minWidth: 0 }}>
+                  <Box sx={{ gridColumn: { xs: "span 2", lg: "span 6" }, minWidth: 0 }}>
                     <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
                       <Typography variant="caption" sx={{ fontWeight: 700 }}>
                         签名信息

@@ -27,3 +27,11 @@ export async function readIconDataUrl(filePath: string): Promise<string | null> 
   }
   return raw;
 }
+
+export async function exportIconWithDialog(sourceFilePath: string, suggestedFileName: string): Promise<string | null> {
+  const raw = await invoke<string | null>("export_icon_with_dialog", {
+    sourceFilePath,
+    suggestedFileName
+  });
+  return typeof raw === "string" && raw.trim().length > 0 ? raw : null;
+}

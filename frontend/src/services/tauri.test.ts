@@ -8,6 +8,9 @@ const { invokeMock } = vi.hoisted(() => ({
     if (cmd === "read_icon_data_url") {
       return "data:image/png;base64,AAAA" as unknown;
     }
+    if (cmd === "export_icon_with_dialog") {
+      return "D:/export/app-icon.png" as unknown;
+    }
     return {
       success: true,
       data: {
@@ -35,8 +38,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: invokeMock
 }));
 
-import { parseApk, pickFiles } from "./tauri";
-import { readIconDataUrl } from "./tauri";
+import { exportIconWithDialog, parseApk, pickFiles, readIconDataUrl } from "./tauri";
 
 describe("parseApk", () => {
   it("invokes tauri parse command and returns normalized envelope", async () => {
@@ -64,5 +66,17 @@ describe("readIconDataUrl", () => {
     const dataUrl = await readIconDataUrl("D:/tmp/icon.png");
     expect(dataUrl).toBe("data:image/png;base64,AAAA");
     expect(invokeMock).toHaveBeenCalledWith("read_icon_data_url", { filePath: "D:/tmp/icon.png" });
+  });
+});
+
+describe("exportIconWithDialog", () => {
+  it("returns save path from tauri command", async () => {
+    invokeMock.mockClear();
+    const savedPath = await exportIconWithDialog("D:/tmp/icon.png", "demo-icon.png");
+    expect(savedPath).toBe("D:/export/app-icon.png");
+    expect(invokeMock).toHaveBeenCalledWith("export_icon_with_dialog", {
+      sourceFilePath: "D:/tmp/icon.png",
+      suggestedFileName: "demo-icon.png"
+    });
   });
 });

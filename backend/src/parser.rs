@@ -74,6 +74,12 @@ fn push_warning(warnings: &mut Vec<String>, code: &str) {
     }
 }
 
+fn push_warning_owned(warnings: &mut Vec<String>, code: String) {
+    if !warnings.iter().any(|w| w == &code) {
+        warnings.push(code);
+    }
+}
+
 mod input_validation {
     use super::*;
 
@@ -543,6 +549,15 @@ mod manifest_reader {
 
 mod resource_resolver {
     use super::*;
+    const RES_STRING_POOL_TYPE: u16 = 0x0001;
+    const RES_TABLE_TYPE: u16 = 0x0002;
+    const RES_TABLE_PACKAGE_TYPE: u16 = 0x0200;
+    const RES_TABLE_TYPE_TYPE: u16 = 0x0201;
+
+    enum AppLabelRef {
+        StringKey(String),
+        ResourceId(u32),
+    }
 
     pub fn resolve_app_name(
         manifest: &mut ManifestInfo,
@@ -557,8 +572,8 @@ mod resource_resolver {
             return;
         }
 
-        if let Some(key) = extract_string_key(&label) {
-            if let Some(v) = read_string_resource(archive, key) {
+        if let Some(label_ref) = parse_label_ref(&label) {
+            if let Some(v) = resolve_from_label_ref(archive, label_ref) {
                 manifest.app_name = Some(v);
                 return;
             }
@@ -568,30 +583,59 @@ mod resource_resolver {
         super::push_warning(warnings, super::warnings::APP_NAME_UNRESOLVED);
     }
 
-    fn extract_string_key(label: &str) -> Option<&str> {
+    fn parse_label_ref(label: &str) -> Option<AppLabelRef> {
+        if let Some(hex) = label.strip_prefix("@0x") {
+            if let Ok(id) = u32::from_str_radix(hex, 16) {
+                return Some(AppLabelRef::ResourceId(id));
+            }
+        }
+
         if let Some(key) = label.strip_prefix("@string/") {
-            return Some(key);
+            return Some(AppLabelRef::StringKey(key.to_string()));
         }
 
         if let Some(raw) = label.strip_prefix('@') {
             if let Some((_, key)) = raw.rsplit_once(":string/") {
-                return Some(key);
+                return Some(AppLabelRef::StringKey(key.to_string()));
             }
             if let Some(key) = raw.strip_prefix("string/") {
-                return Some(key);
+                return Some(AppLabelRef::StringKey(key.to_string()));
             }
         }
 
         None
     }
 
-    fn read_string_resource(archive: &mut ZipArchive<File>, key: &str) -> Option<String> {
-        let mut candidates = vec!["res/values/strings.xml".to_string()];
-        for name in archive_reader::list_entries(archive) {
-            if name.starts_with("res/values") && name.ends_with("/strings.xml") && name != "res/values/strings.xml" {
-                candidates.push(name);
+    fn resolve_from_label_ref(
+        archive: &mut ZipArchive<File>,
+        label_ref: AppLabelRef,
+    ) -> Option<String> {
+        match label_ref {
+            AppLabelRef::StringKey(key) => read_string_resource(archive, &key),
+            AppLabelRef::ResourceId(resource_id) => {
+                let (resource_type, key) = resolve_resource_id_from_arsc(archive, resource_id)?;
+                if resource_type != "string" {
+                    return None;
+                }
+                read_string_resource(archive, &key)
             }
         }
+    }
+
+    fn read_string_resource(archive: &mut ZipArchive<File>, key: &str) -> Option<String> {
+        let mut candidates = archive_reader::list_entries(archive)
+            .into_iter()
+            .filter(|name| {
+                if !name.starts_with("res/values") {
+                    return false;
+                }
+                let Some(file_name) = name.rsplit('/').next() else {
+                    return false;
+                };
+                file_name.starts_with("strings") && file_name.ends_with(".xml")
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| string_file_priority(b).cmp(&string_file_priority(a)));
 
         for path in candidates {
             if let Ok(mut entry) = archive.by_name(&path) {
@@ -604,6 +648,23 @@ mod resource_resolver {
             }
         }
         None
+    }
+
+    fn string_file_priority(path: &str) -> i32 {
+        let lower = path.to_ascii_lowercase();
+        if lower.contains("/values-zh-rcn/") {
+            return 300;
+        }
+        if lower.contains("/values-zh/") {
+            return 220;
+        }
+        if lower == "res/values/strings.xml" {
+            return 200;
+        }
+        if lower.starts_with("res/values/") {
+            return 150;
+        }
+        100
     }
 
     fn find_string_in_xml(xml: &str, key: &str) -> Option<String> {
@@ -643,6 +704,248 @@ mod resource_resolver {
             }
             buf.clear();
         }
+    }
+
+    fn resolve_resource_id_from_arsc(
+        archive: &mut ZipArchive<File>,
+        resource_id: u32,
+    ) -> Option<(String, String)> {
+        let mut entry = archive.by_name("resources.arsc").ok()?;
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).ok()?;
+
+        let package_id = ((resource_id >> 24) & 0xff) as u8;
+        let type_id = ((resource_id >> 16) & 0xff) as u8;
+        let entry_id = (resource_id & 0xffff) as u16;
+
+        parse_arsc_resource_name(&bytes, package_id, type_id, entry_id)
+    }
+
+    fn parse_arsc_resource_name(
+        bytes: &[u8],
+        package_id: u8,
+        target_type_id: u8,
+        target_entry_id: u16,
+    ) -> Option<(String, String)> {
+        if bytes.len() < 12 || le_u16(bytes, 0)? != RES_TABLE_TYPE {
+            return None;
+        }
+        let table_size = le_u32(bytes, 4)? as usize;
+        if table_size > bytes.len() {
+            return None;
+        }
+
+        let mut offset = le_u16(bytes, 2)? as usize;
+        while offset + 8 <= table_size {
+            let chunk_type = le_u16(bytes, offset)?;
+            let header_size = le_u16(bytes, offset + 2)? as usize;
+            let chunk_size = le_u32(bytes, offset + 4)? as usize;
+            if chunk_size == 0 || offset + chunk_size > table_size || header_size > chunk_size {
+                return None;
+            }
+
+            if chunk_type == RES_TABLE_PACKAGE_TYPE {
+                let chunk = &bytes[offset..offset + chunk_size];
+                if let Some(result) =
+                    parse_package_chunk(chunk, package_id, target_type_id, target_entry_id)
+                {
+                    return Some(result);
+                }
+            }
+            offset += chunk_size;
+        }
+        None
+    }
+
+    fn parse_package_chunk(
+        chunk: &[u8],
+        package_id: u8,
+        target_type_id: u8,
+        target_entry_id: u16,
+    ) -> Option<(String, String)> {
+        if chunk.len() < 288 {
+            return None;
+        }
+        let pkg_id = le_u32(chunk, 8)? as u8;
+        if pkg_id != package_id {
+            return None;
+        }
+
+        let type_strings_offset = le_u32(chunk, 268)? as usize;
+        let key_strings_offset = le_u32(chunk, 276)? as usize;
+        let package_header_size = le_u16(chunk, 2)? as usize;
+        if package_header_size > chunk.len() {
+            return None;
+        }
+
+        let type_strings = parse_string_pool_at(chunk, type_strings_offset)?;
+        let key_strings = parse_string_pool_at(chunk, key_strings_offset)?;
+
+        let mut offset = package_header_size;
+        while offset + 8 <= chunk.len() {
+            let chunk_type = le_u16(chunk, offset)?;
+            let header_size = le_u16(chunk, offset + 2)? as usize;
+            let chunk_size = le_u32(chunk, offset + 4)? as usize;
+            if chunk_size == 0 || offset + chunk_size > chunk.len() || header_size > chunk_size {
+                return None;
+            }
+
+            if chunk_type == RES_TABLE_TYPE_TYPE {
+                let type_chunk = &chunk[offset..offset + chunk_size];
+                if let Some(result) = resolve_in_type_chunk(
+                    type_chunk,
+                    &type_strings,
+                    &key_strings,
+                    target_type_id,
+                    target_entry_id,
+                ) {
+                    return Some(result);
+                }
+            }
+            offset += chunk_size;
+        }
+        None
+    }
+
+    fn resolve_in_type_chunk(
+        type_chunk: &[u8],
+        type_strings: &[String],
+        key_strings: &[String],
+        target_type_id: u8,
+        target_entry_id: u16,
+    ) -> Option<(String, String)> {
+        if type_chunk.len() < 32 {
+            return None;
+        }
+        let type_id = *type_chunk.get(8)?;
+        if type_id != target_type_id {
+            return None;
+        }
+        let entry_count = le_u32(type_chunk, 12)? as usize;
+        let entries_start = le_u32(type_chunk, 16)? as usize;
+        let header_size = le_u16(type_chunk, 2)? as usize;
+        if entries_start >= type_chunk.len() || header_size > type_chunk.len() {
+            return None;
+        }
+
+        let target = target_entry_id as usize;
+        if target >= entry_count {
+            return None;
+        }
+        let entry_offset_pos = header_size + target * 4;
+        if entry_offset_pos + 4 > type_chunk.len() {
+            return None;
+        }
+        let entry_offset = le_u32(type_chunk, entry_offset_pos)? as usize;
+        if entry_offset == 0xffff_ffff {
+            return None;
+        }
+        let entry_base = entries_start + entry_offset;
+        if entry_base + 8 > type_chunk.len() {
+            return None;
+        }
+        let key_index = le_u32(type_chunk, entry_base + 4)? as usize;
+
+        let type_name = type_strings.get((type_id - 1) as usize)?.clone();
+        let key_name = key_strings.get(key_index)?.clone();
+        Some((type_name, key_name))
+    }
+
+    fn parse_string_pool_at(bytes: &[u8], offset: usize) -> Option<Vec<String>> {
+        if offset + 8 > bytes.len() || le_u16(bytes, offset)? != RES_STRING_POOL_TYPE {
+            return None;
+        }
+        let chunk_size = le_u32(bytes, offset + 4)? as usize;
+        if offset + chunk_size > bytes.len() {
+            return None;
+        }
+        parse_string_pool_chunk(&bytes[offset..offset + chunk_size])
+    }
+
+    fn parse_string_pool_chunk(chunk: &[u8]) -> Option<Vec<String>> {
+        if chunk.len() < 28 {
+            return None;
+        }
+        let string_count = le_u32(chunk, 8)? as usize;
+        let flags = le_u32(chunk, 16)?;
+        let strings_start = le_u32(chunk, 20)? as usize;
+        let utf8 = (flags & 0x0000_0100) != 0;
+        let index_table_start = 28;
+        let index_table_end = index_table_start + string_count * 4;
+        if index_table_end > chunk.len() {
+            return None;
+        }
+
+        let mut out = Vec::with_capacity(string_count);
+        for i in 0..string_count {
+            let off = le_u32(chunk, index_table_start + i * 4)? as usize;
+            let start = strings_start + off;
+            if start >= chunk.len() {
+                return None;
+            }
+            let s = if utf8 {
+                decode_utf8_pool_string(chunk, start)?
+            } else {
+                decode_utf16_pool_string(chunk, start)?
+            };
+            out.push(s);
+        }
+        Some(out)
+    }
+
+    fn decode_utf8_pool_string(chunk: &[u8], start: usize) -> Option<String> {
+        let (_, off1) = decode_length8(chunk, start)?;
+        let (byte_len, off2) = decode_length8(chunk, off1)?;
+        let end = off2 + byte_len;
+        if end > chunk.len() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&chunk[off2..end]).to_string())
+    }
+
+    fn decode_utf16_pool_string(chunk: &[u8], start: usize) -> Option<String> {
+        let (char_len, mut off) = decode_length16(chunk, start)?;
+        let mut vals = Vec::with_capacity(char_len);
+        for _ in 0..char_len {
+            if off + 2 > chunk.len() {
+                return None;
+            }
+            vals.push(u16::from_le_bytes([chunk[off], chunk[off + 1]]));
+            off += 2;
+        }
+        Some(String::from_utf16_lossy(&vals))
+    }
+
+    fn decode_length8(chunk: &[u8], start: usize) -> Option<(usize, usize)> {
+        let first = *chunk.get(start)?;
+        if (first & 0x80) == 0 {
+            return Some((first as usize, start + 1));
+        }
+        let second = *chunk.get(start + 1)?;
+        Some(((((first & 0x7f) as usize) << 8) | second as usize, start + 2))
+    }
+
+    fn decode_length16(chunk: &[u8], start: usize) -> Option<(usize, usize)> {
+        let first = le_u16(chunk, start)? as usize;
+        if (first & 0x8000) == 0 {
+            return Some((first, start + 2));
+        }
+        let second = le_u16(chunk, start + 2)? as usize;
+        Some((((first & 0x7fff) << 16) | second, start + 4))
+    }
+
+    fn le_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+        let b0 = *bytes.get(offset)?;
+        let b1 = *bytes.get(offset + 1)?;
+        Some(u16::from_le_bytes([b0, b1]))
+    }
+
+    fn le_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+        let b0 = *bytes.get(offset)?;
+        let b1 = *bytes.get(offset + 1)?;
+        let b2 = *bytes.get(offset + 2)?;
+        let b3 = *bytes.get(offset + 3)?;
+        Some(u32::from_le_bytes([b0, b1, b2, b3]))
     }
 }
 mod icon_extractor {
@@ -720,11 +1023,15 @@ mod icon_extractor {
         candidates.retain(|item| seen.insert(item.entry_name.clone()));
 
         for candidate in candidates {
-            let _strategy_name = candidate.strategy_name;
+            let strategy_name = candidate.strategy_name;
             if let Ok(mut entry) = archive.by_name(&candidate.entry_name) {
                 let mut buf = Vec::new();
                 if entry.read_to_end(&mut buf).is_ok() {
                     if let Some(url) = write_icon_to_temp(apk_path, &candidate.entry_name, &buf) {
+                        super::push_warning_owned(
+                            warnings,
+                            strategy_tracking_code(strategy_name),
+                        );
                         return url;
                     }
                 }
@@ -1285,6 +1592,27 @@ mod icon_extractor {
         let normalized = target.to_string_lossy().replace('\\', "/");
         Some(format!("file:///{normalized}"))
     }
+
+    fn strategy_tracking_code(strategy_name: &str) -> String {
+        let mut out = String::from("ICON_PICKED_");
+        let mut prev_underscore = false;
+        for ch in strategy_name.chars() {
+            if ch.is_ascii_alphanumeric() {
+                if ch.is_ascii_uppercase() && !out.ends_with('_') && !prev_underscore {
+                    out.push('_');
+                }
+                out.push(ch.to_ascii_uppercase());
+                prev_underscore = false;
+            } else if !prev_underscore {
+                out.push('_');
+                prev_underscore = true;
+            }
+        }
+        while out.ends_with('_') {
+            out.pop();
+        }
+        out
+    }
 }
 
 mod signer_reader {
@@ -1629,6 +1957,50 @@ mod tests {
     }
 
     #[test]
+    fn app_name_from_resource_id_reference_is_resolved() {
+        let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="@0x7f010000" />
+        </manifest>"#;
+        let strings = r#"<resources><string name="app_name">Demo App Resource Id</string></resources>"#;
+        let arsc = build_minimal_arsc("string", 1, "app_name");
+        let apk = build_zip_with_name(
+            "demo-resource-id.apk",
+            vec![
+                ("AndroidManifest.xml", manifest.as_bytes()),
+                ("resources.arsc", &arsc),
+                ("res/values/strings.xml", strings.as_bytes()),
+            ],
+        );
+
+        let envelope = parse_apk_to_envelope(&apk);
+        assert!(envelope.success);
+        assert_eq!(envelope.data.app_name, "Demo App Resource Id");
+    }
+
+    #[test]
+    fn app_name_prefers_zh_rcn_over_zh_and_default() {
+        let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="@string/app_name" />
+        </manifest>"#;
+        let default_strings = r#"<resources><string name="app_name">Default App</string></resources>"#;
+        let zh_strings = r#"<resources><string name="app_name">中文应用</string></resources>"#;
+        let zh_rcn_strings = r#"<resources><string name="app_name">中文应用（中国）</string></resources>"#;
+        let apk = build_zip_with_name(
+            "demo-locale.apk",
+            vec![
+                ("AndroidManifest.xml", manifest.as_bytes()),
+                ("res/values/strings.xml", default_strings.as_bytes()),
+                ("res/values-zh/strings.xml", zh_strings.as_bytes()),
+                ("res/values-zh-rCN/strings.xml", zh_rcn_strings.as_bytes()),
+            ],
+        );
+
+        let envelope = parse_apk_to_envelope(&apk);
+        assert!(envelope.success);
+        assert_eq!(envelope.data.app_name, "中文应用（中国）");
+    }
+
+    #[test]
     fn unknown_channel_sets_warning() {
         let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android"></manifest>"#;
 
@@ -1662,6 +2034,12 @@ mod tests {
         let envelope = parse_apk_to_envelope(&apk);
         assert!(envelope.success);
         assert!(envelope.data.icon_url.ends_with(".webp"));
+        assert!(
+            envelope
+                .warnings
+                .iter()
+                .any(|item| item == "ICON_PICKED_MANIFEST_PATH")
+        );
     }
 
     #[test]
@@ -1681,6 +2059,12 @@ mod tests {
         let envelope = parse_apk_to_envelope(&apk);
         assert!(envelope.success);
         assert!(envelope.data.icon_url.contains("png"));
+        assert!(
+            envelope
+                .warnings
+                .iter()
+                .any(|item| item == "ICON_PICKED_ROUND_ICON")
+        );
     }
 
     #[test]
@@ -1700,6 +2084,12 @@ mod tests {
         let envelope = parse_apk_to_envelope(&apk);
         assert!(envelope.success);
         assert!(envelope.data.icon_url.ends_with(".png"));
+        assert!(
+            envelope
+                .warnings
+                .iter()
+                .any(|item| item == "ICON_PICKED_MANIFEST_PATH")
+        );
     }
 
     #[test]
@@ -1842,6 +2232,10 @@ mod tests {
     }
 
     fn build_minimal_arsc_drawable(name: &str) -> Vec<u8> {
+        build_minimal_arsc("drawable", 2, name)
+    }
+
+    fn build_minimal_arsc(resource_type: &str, type_id: u8, name: &str) -> Vec<u8> {
         fn push_u16(out: &mut Vec<u8>, value: u16) {
             out.extend_from_slice(&value.to_le_bytes());
         }
@@ -1881,7 +2275,7 @@ mod tests {
             out
         }
 
-        let type_strings = build_string_pool(&["drawable"]);
+        let type_strings = build_string_pool(&[resource_type]);
         let key_strings = build_string_pool(&[name]);
 
         let mut type_chunk = Vec::new();
@@ -1895,7 +2289,7 @@ mod tests {
         push_u16(&mut type_chunk, 0x0201);
         push_u16(&mut type_chunk, type_header_size);
         push_u32(&mut type_chunk, chunk_size as u32);
-        type_chunk.push(2); // type id: drawable
+        type_chunk.push(type_id);
         type_chunk.push(0);
         push_u16(&mut type_chunk, 0);
         push_u32(&mut type_chunk, entry_count);
