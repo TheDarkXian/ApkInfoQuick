@@ -1,4 +1,5 @@
-﻿import { useEffect, useMemo, useState } from "react";
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import CloudUploadIcon from "@mui/icons-material/CloudUpload";
 import ContentCopyIcon from "@mui/icons-material/ContentCopy";
@@ -33,14 +34,15 @@ import {
   Typography
 } from "@mui/material";
 import { parseApk, pickFiles } from "./services/tauri";
+import { toWarningLabel } from "./constants/warnings";
 import { FileTab, TabStatus } from "./types/tab";
 import { renderCopyJson, renderCopyText } from "./utils/copy";
 import { createTabsFromPaths, ParseJob } from "./utils/workspace";
 
 const EMPTY_TEXT = "无数据";
 const MAX_TABS = 10;
-const SECTION_PADDING = 1.25;
-const COMPACT_LIST_ITEM_SX = { py: 0.2, minHeight: 28 };
+const SECTION_PADDING = 0.9;
+const COMPACT_LIST_ITEM_SX = { py: 0.05, minHeight: 24 };
 
 type ToastSeverity = "success" | "info" | "warning" | "error";
 
@@ -61,50 +63,55 @@ function App() {
     message: "",
     severity: "info"
   });
+  const tabsRef = useRef<FileTab[]>([]);
 
   const activeTab = useMemo(
     () => tabs.find((item) => item.id === activeTabId) ?? null,
     [tabs, activeTabId]
   );
 
-  function showToast(message: string, severity: ToastSeverity = "info") {
+  const showToast = useCallback((message: string, severity: ToastSeverity = "info") => {
     setToast({ open: true, message, severity });
-  }
+  }, []);
 
   function closeToast() {
     setToast((prev) => ({ ...prev, open: false }));
   }
 
-  function addFiles(paths: string[]) {
-    if (paths.length === 0) {
-      return;
-    }
-
-    const { createdTabs, jobs, summary } = createTabsFromPaths(paths, tabs, MAX_TABS);
-
-    if (summary.duplicateCount > 0) {
-      showToast("部分文件已存在，已自动忽略重复项。", "info");
-    }
-
-    if (summary.unsupportedCount > 0) {
-      showToast(`已忽略 ${summary.unsupportedCount} 个非 APK/AAB 文件。`, "warning");
-    }
-
-    if (summary.droppedByLimit > 0) {
-      showToast(`最多支持 ${MAX_TABS} 个标签，已忽略 ${summary.droppedByLimit} 个文件。`, "warning");
-    }
-
-    if (createdTabs.length === 0) {
-      if (tabs.length >= MAX_TABS) {
-        showToast(`最多支持 ${MAX_TABS} 个标签。`, "warning");
+  const addFiles = useCallback(
+    (paths: string[]) => {
+      if (paths.length === 0) {
+        return;
       }
-      return;
-    }
 
-    setTabs((prev) => [...prev, ...createdTabs]);
-    setActiveTabId((prev) => prev ?? createdTabs[0].id);
-    setParseQueue((prev) => [...prev, ...jobs]);
-  }
+      const currentTabs = tabsRef.current;
+      const { createdTabs, jobs, summary } = createTabsFromPaths(paths, currentTabs, MAX_TABS);
+
+      if (summary.unsupportedCount > 0) {
+        showToast(`已忽略 ${summary.unsupportedCount} 个非 APK/AAB 文件。`, "warning");
+      }
+
+      if (summary.droppedByLimit > 0) {
+        showToast(`最多支持 ${MAX_TABS} 个标签，已忽略 ${summary.droppedByLimit} 个文件。`, "warning");
+      }
+
+      if (createdTabs.length === 0) {
+        if (currentTabs.length >= MAX_TABS) {
+          showToast(`最多支持 ${MAX_TABS} 个标签。`, "warning");
+        }
+        return;
+      }
+
+      const nextTabs = [...currentTabs, ...createdTabs];
+      tabsRef.current = nextTabs;
+      setTabs(nextTabs);
+      setActiveTabId((prev) => prev ?? createdTabs[0].id);
+      if (jobs.length > 0) {
+        setParseQueue((prev) => [...prev, ...jobs]);
+      }
+    },
+    [showToast]
+  );
 
   async function onPickFile() {
     try {
@@ -115,15 +122,28 @@ function App() {
     }
   }
 
-  function onDownloadIcon(iconUrl: string) {
+  async function onDownloadIcon(iconUrl: string, fileName: string) {
     if (!iconUrl) {
       return;
     }
 
-    const link = document.createElement("a");
-    link.href = iconUrl;
-    link.download = "app-icon.png";
-    link.click();
+    try {
+      const response = await fetch(iconUrl);
+      if (!response.ok) {
+        throw new Error("图标下载失败");
+      }
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      const fallbackName = fileName.replace(/\.(apk|aab)$/i, "");
+      link.href = objectUrl;
+      link.download = `${fallbackName || "app"}-icon`;
+      link.click();
+      URL.revokeObjectURL(objectUrl);
+      showToast("图标导出成功。", "success");
+    } catch {
+      showToast("图标导出失败。", "error");
+    }
   }
 
   function closeCurrentTab() {
@@ -134,6 +154,7 @@ function App() {
     setTabs((prev) => {
       const index = prev.findIndex((item) => item.id === activeTabId);
       const next = prev.filter((item) => item.id !== activeTabId);
+      tabsRef.current = next;
 
       setActiveTabId(() => {
         if (next.length === 0) {
@@ -153,11 +174,16 @@ function App() {
     if (!activeTabId) {
       return;
     }
-    setTabs((prev) => prev.filter((item) => item.id === activeTabId));
+    setTabs((prev) => {
+      const next = prev.filter((item) => item.id === activeTabId);
+      tabsRef.current = next;
+      return next;
+    });
     setParseQueue((prev) => prev.filter((job) => job.id === activeTabId));
   }
 
   function clearAllTabs() {
+    tabsRef.current = [];
     setTabs([]);
     setActiveTabId(null);
     setParseQueue([]);
@@ -168,8 +194,8 @@ function App() {
       return;
     }
 
-    setTabs((prev) =>
-      prev.map((item) =>
+    setTabs((prev) => {
+      const next: FileTab[] = prev.map((item): FileTab =>
         item.id === activeTab.id
           ? {
               ...item,
@@ -177,8 +203,10 @@ function App() {
               localError: null
             }
           : item
-      )
-    );
+      );
+      tabsRef.current = next;
+      return next;
+    });
     setParseQueue((prev) => [...prev, { id: activeTab.id, path: activeTab.path }]);
   }
 
@@ -209,6 +237,10 @@ function App() {
       showToast("复制 JSON 失败。", "error");
     }
   }
+
+  useEffect(() => {
+    tabsRef.current = tabs;
+  }, [tabs]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -244,7 +276,7 @@ function App() {
         unlisten();
       }
     };
-  }, [tabs]);
+  }, [addFiles]);
 
   useEffect(() => {
     if (isParsing || parseQueue.length === 0) {
@@ -255,8 +287,8 @@ function App() {
     setParseQueue((prev) => prev.slice(1));
     setIsParsing(true);
 
-    setTabs((prev) =>
-      prev.map((item) =>
+    setTabs((prev) => {
+      const next: FileTab[] = prev.map((item): FileTab =>
         item.id === currentJob.id
           ? {
               ...item,
@@ -264,8 +296,10 @@ function App() {
               localError: null
             }
           : item
-      )
-    );
+      );
+      tabsRef.current = next;
+      return next;
+    });
 
     void parseApk(currentJob.path)
       .then((result) => {
@@ -273,7 +307,7 @@ function App() {
           if (!prev.some((item) => item.id === currentJob.id)) {
             return prev;
           }
-          return prev.map((item) => {
+          const next: FileTab[] = prev.map((item): FileTab => {
             if (item.id !== currentJob.id) {
               return item;
             }
@@ -281,11 +315,11 @@ function App() {
               ...item,
               envelope: result.envelope,
               status: result.envelope.success ? "success" : "error",
-              localError: result.envelope.success
-                ? null
-                : result.envelope.errorMessage || "解析失败"
+              localError: result.envelope.success ? null : result.envelope.errorMessage || "解析失败"
             };
           });
+          tabsRef.current = next;
+          return next;
         });
       })
       .catch((error) => {
@@ -293,7 +327,7 @@ function App() {
           if (!prev.some((item) => item.id === currentJob.id)) {
             return prev;
           }
-          return prev.map((item) => {
+          const next: FileTab[] = prev.map((item): FileTab => {
             if (item.id !== currentJob.id) {
               return item;
             }
@@ -303,6 +337,8 @@ function App() {
               localError: error instanceof Error ? error.message : "解析请求失败"
             };
           });
+          tabsRef.current = next;
+          return next;
         });
       })
       .finally(() => {
@@ -322,46 +358,61 @@ function App() {
   }, [tabs, activeTabId]);
 
   const activeData = activeTab?.envelope?.data ?? null;
-  const iconUrl = activeData?.iconUrl || "";
+  const rawIconUrl = activeData?.iconUrl || "";
+  const iconUrl = useMemo(() => {
+    if (!rawIconUrl) {
+      return "";
+    }
+    if (!rawIconUrl.startsWith("file://")) {
+      return rawIconUrl;
+    }
+    try {
+      return convertFileSrc(rawIconUrl);
+    } catch {
+      return rawIconUrl;
+    }
+  }, [rawIconUrl]);
   const iconAvailable = Boolean(iconUrl);
   const hasSignaturePartialRisk =
     activeTab?.envelope?.warnings.includes("SIGNATURE_PARTIAL") ||
     activeTab?.envelope?.warnings.includes("SIGNATURE_BLOCK_DETECTED_UNPARSED");
 
   return (
-    <Container maxWidth="xl" sx={{ py: 1.25 }}>
-      <Stack spacing={1}>
+    <Container maxWidth={false} sx={{ py: 0.75, px: 1 }}>
+      <Stack spacing={0.75}>
         <Paper
           variant="outlined"
           sx={{
-            p: 1.25,
+            p: 0.85,
             borderStyle: "dashed",
-            borderWidth: 1.5,
+            borderWidth: 1.2,
             borderColor: dragging ? "primary.main" : "divider",
             backgroundColor: dragging ? "rgba(11, 87, 208, 0.05)" : "background.paper",
             transition: "all 0.2s ease"
           }}
         >
-          <Stack direction={{ xs: "column", md: "row" }} spacing={1} alignItems="center" justifyContent="space-between">
-            <Stack direction="row" spacing={1} alignItems="center">
-              <CloudUploadIcon color="primary" sx={{ fontSize: 22 }} />
-              <Typography variant="body2">拖拽 APK/AAB 到窗口，或手动选择（最多 10 个标签）</Typography>
+          <Stack direction={{ xs: "column", md: "row" }} spacing={0.75} alignItems="center" justifyContent="space-between">
+            <Stack direction="row" spacing={0.75} alignItems="center" sx={{ minWidth: 0 }}>
+              <CloudUploadIcon color="primary" sx={{ fontSize: 18 }} />
+              <Typography variant="caption" noWrap>
+                拖拽 APK/AAB 到窗口或选择文件（最多 10 个标签）
+              </Typography>
             </Stack>
-            <Stack direction="row" spacing={0.75}>
+            <Stack direction="row" spacing={0.5} useFlexGap flexWrap="wrap" justifyContent="flex-end">
               <Button size="small" variant="contained" onClick={onPickFile}>
-                选择文件
+                选择
               </Button>
               <Button size="small" variant="outlined" startIcon={<ContentCopyIcon />} onClick={copyCurrentText}>
-                复制文本
+                文本
               </Button>
               <Button size="small" variant="outlined" startIcon={<DataObjectIcon />} onClick={copyCurrentJson}>
-                复制 JSON
+                JSON
               </Button>
               <Button size="small" variant="outlined" startIcon={<HighlightOffIcon />} onClick={closeCurrentTab}>
-                关闭当前
+                关当前
               </Button>
               <Button size="small" variant="outlined" startIcon={<FilterAltOffIcon />} onClick={closeOtherTabs}>
-                关闭其他
+                关其他
               </Button>
               <Button size="small" color="error" variant="outlined" startIcon={<DeleteSweepIcon />} onClick={clearAllTabs}>
                 清空
@@ -370,13 +421,13 @@ function App() {
           </Stack>
         </Paper>
 
-        <Paper variant="outlined" sx={{ p: 0.5 }}>
+        <Paper variant="outlined" sx={{ p: 0.2 }}>
           <Tabs
             value={activeTabId ?? false}
             onChange={(_, value) => setActiveTabId(value)}
             variant="scrollable"
             scrollButtons="auto"
-            sx={{ minHeight: 32 }}
+            sx={{ minHeight: 30 }}
           >
             {tabs.map((tab) => (
               <Tab
@@ -384,10 +435,10 @@ function App() {
                 value={tab.id}
                 label={<TabLabel name={tab.name} status={tab.status} />}
                 sx={{
-                  minHeight: 32,
+                  minHeight: 30,
                   textTransform: "none",
                   py: 0,
-                  px: 1
+                  px: 0.8
                 }}
               />
             ))}
@@ -395,37 +446,37 @@ function App() {
         </Paper>
 
         {!activeTab ? (
-          <Paper variant="outlined" sx={{ p: 2 }}>
+          <Paper variant="outlined" sx={{ p: 1.2 }}>
             <Typography variant="body2" color="text.secondary">
               暂无标签。请拖入或选择 APK/AAB 文件。
             </Typography>
           </Paper>
         ) : (
           <>
-            <Paper variant="outlined" sx={{ p: 1 }}>
-              <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
-                <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0 }}>
+            <Paper variant="outlined" sx={{ p: 0.7 }}>
+              <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="space-between">
+                <Stack direction="row" spacing={0.75} alignItems="center" sx={{ minWidth: 0 }}>
                   <Chip size="small" label={statusLabel(activeTab.status)} color={statusColor(activeTab.status)} />
                   <Tooltip title={activeTab.path}>
-                    <Typography variant="body2" sx={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    <Typography variant="caption" sx={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                       {activeTab.path}
                     </Typography>
                   </Tooltip>
                 </Stack>
-                <Stack direction="row" spacing={0.75} alignItems="center">
+                <Stack direction="row" spacing={0.4} alignItems="center">
                   {iconAvailable ? (
                     <Box
                       component="img"
                       src={iconUrl}
                       alt="icon"
-                      sx={{ width: 24, height: 24, borderRadius: 1, border: "1px solid", borderColor: "divider" }}
+                      sx={{ width: 20, height: 20, borderRadius: 0.8, border: "1px solid", borderColor: "divider" }}
                     />
                   ) : (
-                    <ImageNotSupportedIcon sx={{ fontSize: 20, color: "text.secondary" }} />
+                    <ImageNotSupportedIcon sx={{ fontSize: 16, color: "text.secondary" }} />
                   )}
                   {iconAvailable && activeTab.ext === "apk" && (
-                    <Button size="small" variant="text" startIcon={<DownloadIcon />} onClick={() => onDownloadIcon(iconUrl)}>
-                      导出图标
+                    <Button size="small" variant="text" startIcon={<DownloadIcon />} onClick={() => onDownloadIcon(iconUrl, activeTab.name)}>
+                      导出
                     </Button>
                   )}
                   {activeTab.ext === "apk" && activeTab.status === "error" && (
@@ -443,8 +494,8 @@ function App() {
               </Paper>
             ) : activeTab.status === "parsing" ? (
               <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
-                <Stack direction="row" spacing={1} alignItems="center">
-                  <CircularProgress size={18} />
+                <Stack direction="row" spacing={0.8} alignItems="center">
+                  <CircularProgress size={16} />
                   <Typography variant="body2">正在按队列顺序解析该 APK...</Typography>
                 </Stack>
               </Paper>
@@ -457,69 +508,81 @@ function App() {
                 <Box
                   sx={{
                     display: "grid",
-                    gap: 0.8,
-                    gridTemplateColumns: { xs: "1fr", lg: "repeat(12, 1fr)" }
+                    gap: 0.55,
+                    gridTemplateColumns: { xs: "repeat(2, minmax(0, 1fr))", md: "repeat(12, minmax(0, 1fr))" }
                   }}
                 >
-                  <Box sx={{ gridColumn: { xs: "1 / -1", lg: "span 4" } }}>
+                  <Box sx={{ gridColumn: { xs: "span 1", md: "span 4" }, minWidth: 0 }}>
                     <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
-                      <Typography variant="subtitle2" gutterBottom>
+                      <Typography variant="caption" sx={{ fontWeight: 700 }}>
                         基础信息
                       </Typography>
                       <List dense sx={{ py: 0 }}>
                         <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                          <ListItemText primary="包名" secondary={activeData.packageName || EMPTY_TEXT} />
-                        </ListItem>
-                        <Divider component="li" />
-                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                          <ListItemText primary="应用名" secondary={activeData.appName || EMPTY_TEXT} />
-                        </ListItem>
-                        <Divider component="li" />
-                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                          <ListItemText primary="渠道" secondary={activeData.channel || "unknown"} />
-                        </ListItem>
-                      </List>
-                    </Paper>
-                  </Box>
-
-                  <Box sx={{ gridColumn: { xs: "1 / -1", lg: "span 4" } }}>
-                    <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
-                      <Typography variant="subtitle2" gutterBottom>
-                        版本信息
-                      </Typography>
-                      <List dense sx={{ py: 0 }}>
-                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                          <ListItemText primary="minSdkVersion" secondary={activeData.minSdkVersion} />
-                        </ListItem>
-                        <Divider component="li" />
-                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                          <ListItemText primary="targetSdkVersion" secondary={activeData.targetSdkVersion} />
-                        </ListItem>
-                        <Divider component="li" />
-                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
                           <ListItemText
-                            primary="compileSdkVersion"
-                            secondary={activeData.compileSdkVersion ?? "null"}
+                            primary="包名"
+                            secondary={activeData.packageName || EMPTY_TEXT}
+                            primaryTypographyProps={{ variant: "caption" }}
+                            secondaryTypographyProps={{ variant: "body2" }}
                           />
                         </ListItem>
                         <Divider component="li" />
                         <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                          <ListItemText primary="versionCode" secondary={activeData.versionCode} />
+                          <ListItemText
+                            primary="应用名"
+                            secondary={activeData.appName || EMPTY_TEXT}
+                            primaryTypographyProps={{ variant: "caption" }}
+                            secondaryTypographyProps={{ variant: "body2" }}
+                          />
                         </ListItem>
                         <Divider component="li" />
                         <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                          <ListItemText primary="versionName" secondary={activeData.versionName ?? "null"} />
+                          <ListItemText
+                            primary="渠道"
+                            secondary={activeData.channel || "unknown"}
+                            primaryTypographyProps={{ variant: "caption" }}
+                            secondaryTypographyProps={{ variant: "body2" }}
+                          />
                         </ListItem>
                       </List>
                     </Paper>
                   </Box>
 
-                  <Box sx={{ gridColumn: { xs: "1 / -1", lg: "span 4" } }}>
+                  <Box sx={{ gridColumn: { xs: "span 1", md: "span 4" }, minWidth: 0 }}>
                     <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
-                      <Typography variant="subtitle2" gutterBottom>
+                      <Typography variant="caption" sx={{ fontWeight: 700 }}>
+                        版本信息
+                      </Typography>
+                      <List dense sx={{ py: 0 }}>
+                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
+                          <ListItemText primary="minSdkVersion" secondary={activeData.minSdkVersion} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
+                        </ListItem>
+                        <Divider component="li" />
+                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
+                          <ListItemText primary="targetSdkVersion" secondary={activeData.targetSdkVersion} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
+                        </ListItem>
+                        <Divider component="li" />
+                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
+                          <ListItemText primary="compileSdkVersion" secondary={activeData.compileSdkVersion ?? "null"} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
+                        </ListItem>
+                        <Divider component="li" />
+                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
+                          <ListItemText primary="versionCode" secondary={activeData.versionCode} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
+                        </ListItem>
+                        <Divider component="li" />
+                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
+                          <ListItemText primary="versionName" secondary={activeData.versionName ?? "null"} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
+                        </ListItem>
+                      </List>
+                    </Paper>
+                  </Box>
+
+                  <Box sx={{ gridColumn: { xs: "span 2", md: "span 4" }, minWidth: 0 }}>
+                    <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
+                      <Typography variant="caption" sx={{ fontWeight: 700 }}>
                         ABI / 警告
                       </Typography>
-                      <Stack spacing={0.75}>
+                      <Stack spacing={0.45} sx={{ mt: 0.4 }}>
                         <Typography variant="caption" color="text.secondary">
                           ABI
                         </Typography>
@@ -528,7 +591,7 @@ function App() {
                             {EMPTY_TEXT}
                           </Typography>
                         ) : (
-                          <Stack direction="row" spacing={0.5} useFlexGap flexWrap="wrap">
+                          <Stack direction="row" spacing={0.45} useFlexGap flexWrap="wrap">
                             {activeData.abis.map((abi) => (
                               <Chip key={abi} size="small" label={abi} />
                             ))}
@@ -536,12 +599,14 @@ function App() {
                         )}
                         <Divider />
                         <Typography variant="caption" color="text.secondary">
-                          Warnings
+                          警告
                         </Typography>
                         {activeTab.envelope?.warnings.length ? (
-                          <Stack direction="row" spacing={0.5} useFlexGap flexWrap="wrap">
+                          <Stack direction="row" spacing={0.45} useFlexGap flexWrap="wrap">
                             {activeTab.envelope.warnings.map((warning) => (
-                              <Chip key={warning} size="small" label={warning} color="warning" variant="outlined" />
+                              <Tooltip key={warning} title={warning}>
+                                <Chip size="small" label={toWarningLabel(warning)} color="warning" variant="outlined" />
+                              </Tooltip>
                             ))}
                           </Stack>
                         ) : (
@@ -553,20 +618,20 @@ function App() {
                     </Paper>
                   </Box>
 
-                  <Box sx={{ gridColumn: { xs: "1 / -1", lg: "span 6" } }}>
+                  <Box sx={{ gridColumn: { xs: "span 2", md: "span 6" }, minWidth: 0 }}>
                     <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
-                      <Typography variant="subtitle2" gutterBottom>
+                      <Typography variant="caption" sx={{ fontWeight: 700 }}>
                         权限列表
                       </Typography>
                       {activeData.permissions.length === 0 ? (
-                        <Typography variant="body2" color="text.secondary">
+                        <Typography variant="body2" color="text.secondary" sx={{ mt: 0.35 }}>
                           {EMPTY_TEXT}
                         </Typography>
                       ) : (
-                        <List dense sx={{ py: 0 }}>
+                        <List dense sx={{ py: 0, maxHeight: 240, overflowY: "auto" }}>
                           {activeData.permissions.map((permission) => (
                             <ListItem key={permission} sx={COMPACT_LIST_ITEM_SX}>
-                              <ListItemText primary={permission} />
+                              <ListItemText primary={permission} primaryTypographyProps={{ variant: "caption" }} />
                             </ListItem>
                           ))}
                         </List>
@@ -574,13 +639,13 @@ function App() {
                     </Paper>
                   </Box>
 
-                  <Box sx={{ gridColumn: { xs: "1 / -1", lg: "span 6" } }}>
+                  <Box sx={{ gridColumn: { xs: "span 2", md: "span 6" }, minWidth: 0 }}>
                     <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
-                      <Typography variant="subtitle2" gutterBottom>
+                      <Typography variant="caption" sx={{ fontWeight: 700 }}>
                         签名信息
                       </Typography>
                       {hasSignaturePartialRisk && (
-                        <Alert severity="warning" sx={{ mb: 1 }}>
+                        <Alert severity="warning" sx={{ mt: 0.45, mb: 0.6, py: 0 }}>
                           当前签名信息为尽力解析，部分证书元数据可能不完整。
                         </Alert>
                       )}
@@ -589,30 +654,27 @@ function App() {
                           {EMPTY_TEXT}
                         </Typography>
                       ) : (
-                        <Stack spacing={0.75}>
+                        <Stack spacing={0.55}>
                           {activeData.signers.map((signer, index) => (
-                            <Paper key={`${signer.certSha256}-${index}`} variant="outlined" sx={{ p: 0.75 }}>
+                            <Paper key={`${signer.certSha256}-${index}`} variant="outlined" sx={{ p: 0.5 }}>
                               <Typography variant="caption" sx={{ fontWeight: 600 }}>
                                 签名者 #{index + 1}
                               </Typography>
                               <List dense sx={{ py: 0 }}>
                                 <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                                  <ListItemText primary="scheme" secondary={signer.scheme || EMPTY_TEXT} />
+                                  <ListItemText primary="scheme" secondary={signer.scheme || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
                                 </ListItem>
                                 <Divider component="li" />
                                 <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                                  <ListItemText
-                                    primary="certSha256"
-                                    secondary={signer.certSha256 || EMPTY_TEXT}
-                                  />
+                                  <ListItemText primary="certSha256" secondary={signer.certSha256 || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
                                 </ListItem>
                                 <Divider component="li" />
                                 <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                                  <ListItemText primary="issuer" secondary={signer.issuer || EMPTY_TEXT} />
+                                  <ListItemText primary="issuer" secondary={signer.issuer || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
                                 </ListItem>
                                 <Divider component="li" />
                                 <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                                  <ListItemText primary="subject" secondary={signer.subject || EMPTY_TEXT} />
+                                  <ListItemText primary="subject" secondary={signer.subject || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
                                 </ListItem>
                               </List>
                             </Paper>
@@ -644,9 +706,9 @@ function App() {
 
 function TabLabel({ name, status }: { name: string; status: TabStatus }) {
   return (
-    <Stack direction="row" spacing={0.5} alignItems="center">
+    <Stack direction="row" spacing={0.4} alignItems="center">
       <StatusIcon status={status} />
-      <Typography variant="caption" sx={{ maxWidth: 180 }} noWrap>
+      <Typography variant="caption" sx={{ maxWidth: 170 }} noWrap>
         {name}
       </Typography>
     </Stack>

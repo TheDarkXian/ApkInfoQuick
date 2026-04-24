@@ -1,4 +1,4 @@
-import { FileTab } from "../types/tab";
+﻿import { FileTab } from "../types/tab";
 
 export interface ParseJob {
   id: string;
@@ -15,6 +15,13 @@ export interface AddFilesResult {
   createdTabs: FileTab[];
   jobs: ParseJob[];
   summary: AddFilesSummary;
+}
+
+function createUniqueId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `tab-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 export function inferFileExt(path: string): "apk" | "aab" | "other" {
@@ -37,7 +44,8 @@ export function createTabsFromPaths(
   incomingPaths: string[],
   existingTabs: FileTab[],
   maxTabs: number,
-  now = Date.now()
+  now = Date.now(),
+  idFactory: () => string = createUniqueId
 ): AddFilesResult {
   const existingPathSet = new Set(existingTabs.map((item) => item.path.toLowerCase()));
   const createdTabs: FileTab[] = [];
@@ -48,7 +56,7 @@ export function createTabsFromPaths(
     droppedByLimit: 0
   };
 
-  incomingPaths.forEach((path, index) => {
+  incomingPaths.forEach((path) => {
     const key = path.toLowerCase();
     if (existingPathSet.has(key)) {
       summary.duplicateCount += 1;
@@ -67,7 +75,7 @@ export function createTabsFromPaths(
       return;
     }
 
-    const id = `${now}-${index}-${path}`;
+    const id = idFactory();
     const tab: FileTab = {
       id,
       name: getFileName(path),

@@ -52,4 +52,16 @@ describe("createTabsFromPaths", () => {
     expect(result.summary.droppedByLimit).toBe(1);
     expect(result.createdTabs.map((item) => item.path)).toEqual(["D:/ok.apk"]);
   });
+
+  it("uses provided idFactory to keep ids unique", () => {
+    let serial = 0;
+    const result = createTabsFromPaths(
+      ["D:/a.apk", "D:/b.apk"],
+      [],
+      10,
+      123,
+      () => `id-${serial++}`
+    );
+    expect(result.createdTabs.map((item) => item.id)).toEqual(["id-0", "id-1"]);
+  });
 });
