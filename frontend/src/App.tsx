@@ -36,14 +36,15 @@ import {
 } from "@mui/material";
 import { exportIconWithDialog, parseApk, pickFiles, readIconDataUrl } from "./services/tauri";
 import { isIconPickedWarning, toWarningLabel } from "./constants/warnings";
+import { ApkInfoData } from "./types/apk";
 import { FileTab, TabStatus } from "./types/tab";
 import { renderCopyJson, renderCopyText } from "./utils/copy";
 import { createTabsFromPaths, ParseJob } from "./utils/workspace";
 
 const EMPTY_TEXT = "无数据";
 const MAX_TABS = 10;
-const SECTION_PADDING = 0.72;
-const COMPACT_LIST_ITEM_SX = { py: 0.02, minHeight: 22 };
+const SECTION_PADDING = 0.55;
+const COMPACT_LIST_ITEM_SX = { py: 0, minHeight: 20 };
 const DIAGNOSTIC_WARNING_CODES = new Set([
   "AAPT_NOT_FOUND_FALLBACK_USED",
   "AAPT_BADGING_FAILED_FALLBACK_USED",
@@ -552,25 +553,7 @@ function App() {
             </Typography>
           </Paper>
         ) : (
-          <>
-            <Paper variant="outlined" sx={{ p: 0.7 }}>
-              <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="space-between">
-                <Stack direction="row" spacing={0.75} alignItems="center" sx={{ minWidth: 0 }}>
-                  <Chip size="small" label={statusLabel(activeTab.status)} color={statusColor(activeTab.status)} />
-                  <Tooltip title={activeTab.path}>
-                    <Typography variant="caption" sx={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                      {activeTab.path}
-                    </Typography>
-                  </Tooltip>
-                </Stack>
-                {activeTab.ext === "apk" && activeTab.status === "error" && (
-                  <Button size="small" variant="outlined" onClick={retryCurrent}>
-                    重试
-                  </Button>
-                )}
-              </Stack>
-            </Paper>
-
+          <Stack spacing={0.55}>
             {activeTab.ext === "aab" ? (
               <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
                 <Alert severity="info">占位：AAB 暂不解析，已保留路径与标签。</Alert>
@@ -589,12 +572,6 @@ function App() {
             ) : (
               activeData && (
                 <Stack spacing={0.55}>
-                  <IconPanel
-                    iconSrc={activeResolvedIconUrl}
-                    iconPickedWarning={iconPickedWarning}
-                    canExport={Boolean(rawIconUrl && iconAvailable)}
-                    onExport={() => onDownloadIcon(rawIconUrl, activeTab.name)}
-                  />
                   <Box
                     sx={{
                       display: "grid",
@@ -602,69 +579,17 @@ function App() {
                       gridTemplateColumns: { xs: "repeat(2, minmax(0, 1fr))", lg: "repeat(12, minmax(0, 1fr))" }
                     }}
                   >
-                  <Box sx={{ gridColumn: { xs: "span 1", lg: "span 4" }, minWidth: 0 }}>
-                    <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
-                      <Typography variant="caption" sx={{ fontWeight: 700 }}>
-                        基础信息
-                      </Typography>
-                      <List dense sx={{ py: 0 }}>
-                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                          <ListItemText
-                            primary="包名"
-                            secondary={activeData.packageName || EMPTY_TEXT}
-                            primaryTypographyProps={{ variant: "caption" }}
-                            secondaryTypographyProps={{ variant: "body2" }}
-                          />
-                        </ListItem>
-                        <Divider component="li" />
-                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                          <ListItemText
-                            primary="应用名"
-                            secondary={activeData.appName || EMPTY_TEXT}
-                            primaryTypographyProps={{ variant: "caption" }}
-                            secondaryTypographyProps={{ variant: "body2" }}
-                          />
-                        </ListItem>
-                        <Divider component="li" />
-                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                          <ListItemText
-                            primary="渠道"
-                            secondary={activeData.channel || "unknown"}
-                            primaryTypographyProps={{ variant: "caption" }}
-                            secondaryTypographyProps={{ variant: "body2" }}
-                          />
-                        </ListItem>
-                      </List>
-                    </Paper>
+                  <Box sx={{ gridColumn: { xs: "span 1", lg: "span 2" }, minWidth: 0 }}>
+                    <IconPanel
+                      iconSrc={activeResolvedIconUrl}
+                      iconPickedWarning={iconPickedWarning}
+                      canExport={Boolean(rawIconUrl && iconAvailable)}
+                      onExport={() => onDownloadIcon(rawIconUrl, activeTab.name)}
+                    />
                   </Box>
 
-                  <Box sx={{ gridColumn: { xs: "span 1", lg: "span 4" }, minWidth: 0 }}>
-                    <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
-                      <Typography variant="caption" sx={{ fontWeight: 700 }}>
-                        版本信息
-                      </Typography>
-                      <List dense sx={{ py: 0 }}>
-                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                          <ListItemText primary="minSdkVersion" secondary={activeData.minSdkVersion} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
-                        </ListItem>
-                        <Divider component="li" />
-                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                          <ListItemText primary="targetSdkVersion" secondary={activeData.targetSdkVersion} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
-                        </ListItem>
-                        <Divider component="li" />
-                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                          <ListItemText primary="compileSdkVersion" secondary={activeData.compileSdkVersion ?? "null"} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
-                        </ListItem>
-                        <Divider component="li" />
-                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                          <ListItemText primary="versionCode" secondary={activeData.versionCode} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
-                        </ListItem>
-                        <Divider component="li" />
-                        <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                          <ListItemText primary="versionName" secondary={activeData.versionName ?? "null"} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
-                        </ListItem>
-                      </List>
-                    </Paper>
+                  <Box sx={{ gridColumn: { xs: "span 1", lg: "span 6" }, minWidth: 0 }}>
+                    <CoreInfoPanel data={activeData} />
                   </Box>
 
                   <Box sx={{ gridColumn: { xs: "span 2", lg: "span 4" }, minWidth: 0 }}>
@@ -735,7 +660,7 @@ function App() {
                     </Paper>
                   </Box>
 
-                  <Box sx={{ gridColumn: { xs: "span 2", lg: "span 6" }, minWidth: 0 }}>
+                  <Box sx={{ gridColumn: { xs: "span 2", lg: "span 8" }, minWidth: 0 }}>
                     <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
                       <Typography variant="caption" sx={{ fontWeight: 700 }}>
                         权限列表
@@ -745,7 +670,7 @@ function App() {
                           {EMPTY_TEXT}
                         </Typography>
                       ) : (
-                        <List dense sx={{ py: 0, maxHeight: 240, overflowY: "auto" }}>
+                        <List dense sx={{ py: 0, maxHeight: 210, overflowY: "auto" }}>
                           {activeData.permissions.map((permission) => (
                             <ListItem key={permission} sx={COMPACT_LIST_ITEM_SX}>
                               <ListItemText primary={permission} primaryTypographyProps={{ variant: "caption" }} />
@@ -756,7 +681,7 @@ function App() {
                     </Paper>
                   </Box>
 
-                  <Box sx={{ gridColumn: { xs: "span 2", lg: "span 6" }, minWidth: 0 }}>
+                  <Box sx={{ gridColumn: { xs: "span 2", lg: "span 4" }, minWidth: 0 }}>
                     <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
                       <Stack direction="row" justifyContent="space-between" alignItems="center">
                         <Typography variant="caption" sx={{ fontWeight: 700 }}>
@@ -821,7 +746,8 @@ function App() {
                 </Stack>
               )
             )}
-          </>
+            <SourcePanel tab={activeTab} onRetry={retryCurrent} />
+          </Stack>
         )}
       </Stack>
 
@@ -851,53 +777,115 @@ function IconPanel({
   onExport: () => void;
 }) {
   return (
-    <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
-      <Stack
-        direction={{ xs: "row", sm: "row" }}
-        spacing={0.8}
-        alignItems="center"
-        justifyContent="space-between"
-        sx={{ minWidth: 0 }}
-      >
-        <Stack direction="row" spacing={0.8} alignItems="center" sx={{ minWidth: 0 }}>
-          <Box
-            sx={{
-              width: { xs: 88, sm: 112 },
-              height: { xs: 88, sm: 112 },
-              borderRadius: 1.4,
-              border: "1px solid",
-              borderColor: "divider",
-              backgroundColor: "rgba(15, 23, 42, 0.025)",
-              display: "grid",
-              placeItems: "center",
-              flex: "0 0 auto",
-              overflow: "hidden"
-            }}
-          >
-            {iconSrc ? (
-              <Box component="img" src={iconSrc} alt="应用图标" sx={{ width: "86%", height: "86%", objectFit: "contain" }} />
-            ) : (
-              <ImageNotSupportedIcon sx={{ fontSize: 36, color: "text.secondary" }} />
-            )}
-          </Box>
-          <Stack spacing={0.35} sx={{ minWidth: 0 }}>
-            <Typography variant="caption" sx={{ fontWeight: 700 }}>
-              图标
-            </Typography>
-            {iconPickedWarning ? (
-              <Tooltip title={iconPickedWarning}>
-                <Chip size="small" label={toWarningLabel(iconPickedWarning)} color="info" variant="outlined" sx={{ alignSelf: "flex-start" }} />
-              </Tooltip>
-            ) : (
-              <Typography variant="body2" color="text.secondary">
-                {iconSrc ? "已解析图标，来源未标记" : "未解析到图标"}
-              </Typography>
-            )}
-          </Stack>
-        </Stack>
-        <Button size="small" variant="outlined" startIcon={<DownloadIcon />} disabled={!canExport} onClick={onExport} sx={{ flex: "0 0 auto" }}>
+    <Paper variant="outlined" sx={{ p: SECTION_PADDING, height: "100%" }}>
+      <Stack spacing={0.45} alignItems="center" sx={{ height: "100%" }}>
+        <Typography variant="caption" sx={{ fontWeight: 700, alignSelf: "stretch" }}>
+          图标
+        </Typography>
+        <Box
+          sx={{
+            width: { xs: 82, sm: 96 },
+            height: { xs: 82, sm: 96 },
+            borderRadius: 1.35,
+            border: "1px solid",
+            borderColor: "divider",
+            backgroundColor: "rgba(15, 23, 42, 0.025)",
+            display: "grid",
+            placeItems: "center",
+            overflow: "hidden"
+          }}
+        >
+          {iconSrc ? (
+            <Box component="img" src={iconSrc} alt="应用图标" sx={{ width: "86%", height: "86%", objectFit: "contain" }} />
+          ) : (
+            <ImageNotSupportedIcon sx={{ fontSize: 34, color: "text.secondary" }} />
+          )}
+        </Box>
+        {iconPickedWarning ? (
+          <Tooltip title={iconPickedWarning}>
+            <Chip size="small" label={toWarningLabel(iconPickedWarning)} color="info" variant="outlined" sx={{ maxWidth: "100%" }} />
+          </Tooltip>
+        ) : (
+          <Typography variant="caption" color="text.secondary">
+            {iconSrc ? "来源未标记" : "未解析到图标"}
+          </Typography>
+        )}
+        <Button size="small" variant="outlined" startIcon={<DownloadIcon />} disabled={!canExport} onClick={onExport} sx={{ mt: "auto" }}>
           导出
         </Button>
+      </Stack>
+    </Paper>
+  );
+}
+
+function CoreInfoPanel({ data }: { data: ApkInfoData }) {
+  return (
+    <Paper variant="outlined" sx={{ p: SECTION_PADDING, height: "100%" }}>
+      <Typography variant="caption" sx={{ fontWeight: 700 }}>
+        核心信息
+      </Typography>
+      <Box
+        sx={{
+          display: "grid",
+          gap: "1px 8px",
+          gridTemplateColumns: { xs: "1fr", sm: "repeat(2, minmax(0, 1fr))" },
+          mt: 0.35
+        }}
+      >
+        <DetailField label="包名" value={data.packageName || EMPTY_TEXT} wide />
+        <DetailField label="应用名" value={data.appName || EMPTY_TEXT} />
+        <DetailField label="渠道" value={data.channel || "unknown"} />
+        <DetailField label="versionCode" value={data.versionCode} />
+        <DetailField label="versionName" value={data.versionName ?? "null"} />
+        <DetailField label="minSdk" value={data.minSdkVersion} />
+        <DetailField label="targetSdk" value={data.targetSdkVersion} />
+        <DetailField label="compileSdk" value={data.compileSdkVersion ?? "null"} />
+      </Box>
+    </Paper>
+  );
+}
+
+function DetailField({ label, value, wide = false }: { label: string; value: string | number; wide?: boolean }) {
+  return (
+    <Box
+      sx={{
+        minWidth: 0,
+        gridColumn: wide ? { xs: "span 1", sm: "span 2" } : "span 1",
+        py: 0.22,
+        borderBottom: "1px solid",
+        borderColor: "divider"
+      }}
+    >
+      <Typography variant="caption" color="text.secondary" sx={{ display: "block", lineHeight: 1.15 }}>
+        {label}
+      </Typography>
+      <Typography variant="body2" sx={{ lineHeight: 1.28, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={String(value)}>
+        {value}
+      </Typography>
+    </Box>
+  );
+}
+
+function SourcePanel({ tab, onRetry }: { tab: FileTab; onRetry: () => void }) {
+  return (
+    <Paper variant="outlined" sx={{ p: 0.55 }}>
+      <Stack direction="row" spacing={0.6} alignItems="center" justifyContent="space-between">
+        <Stack direction="row" spacing={0.55} alignItems="center" sx={{ minWidth: 0 }}>
+          <Typography variant="caption" sx={{ fontWeight: 700, flex: "0 0 auto" }}>
+            文件来源
+          </Typography>
+          <Chip size="small" label={statusLabel(tab.status)} color={statusColor(tab.status)} />
+          <Tooltip title={tab.path}>
+            <Typography variant="caption" sx={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              {tab.path}
+            </Typography>
+          </Tooltip>
+        </Stack>
+        {tab.ext === "apk" && tab.status === "error" && (
+          <Button size="small" variant="outlined" onClick={onRetry}>
+            重试
+          </Button>
+        )}
       </Stack>
     </Paper>
   );
