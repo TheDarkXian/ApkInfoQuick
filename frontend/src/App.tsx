@@ -75,6 +75,7 @@ function App() {
     message: "",
     severity: "info"
   });
+  const [tabIconUrls, setTabIconUrls] = useState<Record<string, string | null>>({});
   const [resolvedIconUrl, setResolvedIconUrl] = useState("");
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [signerExpanded, setSignerExpanded] = useState(false);
@@ -164,9 +165,10 @@ function App() {
       return;
     }
 
+    const closingTabId = activeTabId;
     setTabs((prev) => {
-      const index = prev.findIndex((item) => item.id === activeTabId);
-      const next = prev.filter((item) => item.id !== activeTabId);
+      const index = prev.findIndex((item) => item.id === closingTabId);
+      const next = prev.filter((item) => item.id !== closingTabId);
       tabsRef.current = next;
 
       setActiveTabId(() => {
@@ -180,7 +182,8 @@ function App() {
       return next;
     });
 
-    setParseQueue((prev) => prev.filter((job) => job.id !== activeTabId));
+    setParseQueue((prev) => prev.filter((job) => job.id !== closingTabId));
+    setTabIconUrls((prev) => omitIconCache(prev, [closingTabId]));
   }
 
   function closeOtherTabs() {
@@ -193,6 +196,10 @@ function App() {
       return next;
     });
     setParseQueue((prev) => prev.filter((job) => job.id === activeTabId));
+    setTabIconUrls((prev) => {
+      const kept = activeTabId ? prev[activeTabId] : undefined;
+      return activeTabId && kept !== undefined ? { [activeTabId]: kept } : {};
+    });
   }
 
   function clearAllTabs() {
@@ -200,6 +207,7 @@ function App() {
     setTabs([]);
     setActiveTabId(null);
     setParseQueue([]);
+    setTabIconUrls({});
   }
 
   function retryCurrent() {
@@ -220,6 +228,7 @@ function App() {
       tabsRef.current = next;
       return next;
     });
+    setTabIconUrls((prev) => omitIconCache(prev, [activeTab.id]));
     setParseQueue((prev) => [...prev, { id: activeTab.id, path: activeTab.path }]);
   }
 
@@ -313,6 +322,7 @@ function App() {
       tabsRef.current = next;
       return next;
     });
+    setTabIconUrls((prev) => omitIconCache(prev, [currentJob.id]));
 
     void parseApk(currentJob.path)
       .then((result) => {
@@ -370,15 +380,53 @@ function App() {
     }
   }, [tabs, activeTabId]);
 
+  useEffect(() => {
+    const targets = tabs.filter(
+      (tab) => tab.status === "success" && Boolean(tab.envelope?.data?.iconUrl) && tabIconUrls[tab.id] === undefined
+    );
+    if (targets.length === 0) {
+      return;
+    }
+
+    setTabIconUrls((prev) => {
+      const next = { ...prev };
+      for (const tab of targets) {
+        if (next[tab.id] === undefined) {
+          next[tab.id] = null;
+        }
+      }
+      return next;
+    });
+
+    for (const tab of targets) {
+      const iconUrl = tab.envelope?.data?.iconUrl || "";
+      void resolveIconDataUrl(iconUrl)
+        .then((dataUrl) => {
+          const currentTab = tabsRef.current.find((item) => item.id === tab.id);
+          if (currentTab?.status !== "success" || currentTab.envelope?.data?.iconUrl !== iconUrl) {
+            return;
+          }
+          setTabIconUrls((prev) => ({ ...prev, [tab.id]: dataUrl }));
+        })
+        .catch(() => {
+          if (!tabsRef.current.some((item) => item.id === tab.id)) {
+            return;
+          }
+          setTabIconUrls((prev) => ({ ...prev, [tab.id]: null }));
+        });
+    }
+  }, [tabs, tabIconUrls]);
+
   const activeData = activeTab?.envelope?.data ?? null;
   const rawIconUrl = activeData?.iconUrl || "";
-  const iconAvailable = Boolean(resolvedIconUrl);
+  const activeResolvedIconUrl = (activeTabId ? tabIconUrls[activeTabId] : null) || resolvedIconUrl;
+  const iconAvailable = Boolean(activeResolvedIconUrl);
   const hasSignaturePartialRisk =
     activeTab?.envelope?.warnings.includes("SIGNATURE_PARTIAL") ||
     activeTab?.envelope?.warnings.includes("SIGNATURE_BLOCK_DETECTED_UNPARSED");
   const allWarnings = activeTab?.envelope?.warnings ?? [];
   const iconPickedWarning = allWarnings.find((item) => isIconPickedWarning(item)) ?? "";
-  const iconResolvedSuccessfully = Boolean(rawIconUrl && resolvedIconUrl);
+  const iconResolvedSuccessfully = Boolean(rawIconUrl && activeResolvedIconUrl);
   const diagnosticWarnings = allWarnings.filter((item) => {
     if (isIconPickedWarning(item)) {
       return false;
@@ -406,22 +454,8 @@ function App() {
         return;
       }
 
-      if (!rawIconUrl.startsWith("file://")) {
-        if (active) {
-          setResolvedIconUrl(rawIconUrl);
-        }
-        return;
-      }
-
       try {
-        const filePath = toLocalFilePath(rawIconUrl);
-        if (!filePath) {
-          if (active) {
-            setResolvedIconUrl("");
-          }
-          return;
-        }
-        const dataUrl = await readIconDataUrl(filePath);
+        const dataUrl = await resolveIconDataUrl(rawIconUrl);
         if (active) {
           setResolvedIconUrl(dataUrl ?? "");
         }
@@ -499,7 +533,7 @@ function App() {
               <Tab
                 key={tab.id}
                 value={tab.id}
-                label={<TabLabel name={tab.name} status={tab.status} />}
+                label={<TabLabel name={tab.name} status={tab.status} iconSrc={tabIconUrls[tab.id] || ""} />}
                 sx={{
                   minHeight: 30,
                   textTransform: "none",
@@ -529,28 +563,11 @@ function App() {
                     </Typography>
                   </Tooltip>
                 </Stack>
-                <Stack direction="row" spacing={0.55} alignItems="center">
-                  {iconAvailable ? (
-                    <Box
-                      component="img"
-                      src={resolvedIconUrl}
-                      alt="icon"
-                      sx={{ width: 40, height: 40, borderRadius: 1, border: "1px solid", borderColor: "divider", objectFit: "contain" }}
-                    />
-                  ) : (
-                    <ImageNotSupportedIcon sx={{ fontSize: 24, color: "text.secondary" }} />
-                  )}
-                  {iconAvailable && activeTab.ext === "apk" && (
-                    <Button size="small" variant="outlined" startIcon={<DownloadIcon />} onClick={() => onDownloadIcon(rawIconUrl, activeTab.name)}>
-                      导出
-                    </Button>
-                  )}
-                  {activeTab.ext === "apk" && activeTab.status === "error" && (
-                    <Button size="small" variant="outlined" onClick={retryCurrent}>
-                      重试
-                    </Button>
-                  )}
-                </Stack>
+                {activeTab.ext === "apk" && activeTab.status === "error" && (
+                  <Button size="small" variant="outlined" onClick={retryCurrent}>
+                    重试
+                  </Button>
+                )}
               </Stack>
             </Paper>
 
@@ -571,13 +588,20 @@ function App() {
               </Paper>
             ) : (
               activeData && (
-                <Box
-                  sx={{
-                    display: "grid",
-                    gap: 0.55,
-                    gridTemplateColumns: { xs: "repeat(2, minmax(0, 1fr))", lg: "repeat(12, minmax(0, 1fr))" }
-                  }}
-                >
+                <Stack spacing={0.55}>
+                  <IconPanel
+                    iconSrc={activeResolvedIconUrl}
+                    iconPickedWarning={iconPickedWarning}
+                    canExport={Boolean(rawIconUrl && iconAvailable)}
+                    onExport={() => onDownloadIcon(rawIconUrl, activeTab.name)}
+                  />
+                  <Box
+                    sx={{
+                      display: "grid",
+                      gap: 0.55,
+                      gridTemplateColumns: { xs: "repeat(2, minmax(0, 1fr))", lg: "repeat(12, minmax(0, 1fr))" }
+                    }}
+                  >
                   <Box sx={{ gridColumn: { xs: "span 1", lg: "span 4" }, minWidth: 0 }}>
                     <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
                       <Typography variant="caption" sx={{ fontWeight: 700 }}>
@@ -649,19 +673,6 @@ function App() {
                         ABI / 警告
                       </Typography>
                       <Stack spacing={0.45} sx={{ mt: 0.4 }}>
-                        <Typography variant="caption" color="text.secondary">
-                          图标来源
-                        </Typography>
-                        {iconPickedWarning ? (
-                          <Tooltip title={iconPickedWarning}>
-                            <Chip size="small" label={toWarningLabel(iconPickedWarning)} color="info" variant="outlined" />
-                          </Tooltip>
-                        ) : (
-                          <Typography variant="body2" color="text.secondary">
-                            {EMPTY_TEXT}
-                          </Typography>
-                        )}
-                        <Divider />
                         <Typography variant="caption" color="text.secondary">
                           ABI
                         </Typography>
@@ -806,7 +817,8 @@ function App() {
                       )}
                     </Paper>
                   </Box>
-                </Box>
+                  </Box>
+                </Stack>
               )
             )}
           </>
@@ -827,10 +839,103 @@ function App() {
   );
 }
 
-function TabLabel({ name, status }: { name: string; status: TabStatus }) {
+function IconPanel({
+  iconSrc,
+  iconPickedWarning,
+  canExport,
+  onExport
+}: {
+  iconSrc: string;
+  iconPickedWarning: string;
+  canExport: boolean;
+  onExport: () => void;
+}) {
   return (
-    <Stack direction="row" spacing={0.4} alignItems="center">
-      <StatusIcon status={status} />
+    <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
+      <Stack
+        direction={{ xs: "row", sm: "row" }}
+        spacing={0.8}
+        alignItems="center"
+        justifyContent="space-between"
+        sx={{ minWidth: 0 }}
+      >
+        <Stack direction="row" spacing={0.8} alignItems="center" sx={{ minWidth: 0 }}>
+          <Box
+            sx={{
+              width: { xs: 88, sm: 112 },
+              height: { xs: 88, sm: 112 },
+              borderRadius: 1.4,
+              border: "1px solid",
+              borderColor: "divider",
+              backgroundColor: "rgba(15, 23, 42, 0.025)",
+              display: "grid",
+              placeItems: "center",
+              flex: "0 0 auto",
+              overflow: "hidden"
+            }}
+          >
+            {iconSrc ? (
+              <Box component="img" src={iconSrc} alt="应用图标" sx={{ width: "86%", height: "86%", objectFit: "contain" }} />
+            ) : (
+              <ImageNotSupportedIcon sx={{ fontSize: 36, color: "text.secondary" }} />
+            )}
+          </Box>
+          <Stack spacing={0.35} sx={{ minWidth: 0 }}>
+            <Typography variant="caption" sx={{ fontWeight: 700 }}>
+              图标
+            </Typography>
+            {iconPickedWarning ? (
+              <Tooltip title={iconPickedWarning}>
+                <Chip size="small" label={toWarningLabel(iconPickedWarning)} color="info" variant="outlined" sx={{ alignSelf: "flex-start" }} />
+              </Tooltip>
+            ) : (
+              <Typography variant="body2" color="text.secondary">
+                {iconSrc ? "已解析图标，来源未标记" : "未解析到图标"}
+              </Typography>
+            )}
+          </Stack>
+        </Stack>
+        <Button size="small" variant="outlined" startIcon={<DownloadIcon />} disabled={!canExport} onClick={onExport} sx={{ flex: "0 0 auto" }}>
+          导出
+        </Button>
+      </Stack>
+    </Paper>
+  );
+}
+
+function TabLabel({ name, status, iconSrc }: { name: string; status: TabStatus; iconSrc?: string }) {
+  return (
+    <Stack direction="row" spacing={0.4} alignItems="center" sx={{ minWidth: 0 }}>
+      {iconSrc && status === "success" ? (
+        <Box
+          sx={{
+            position: "relative",
+            width: 18,
+            height: 18,
+            flex: "0 0 auto"
+          }}
+        >
+          <Box
+            component="img"
+            src={iconSrc}
+            alt=""
+            sx={{ width: 18, height: 18, borderRadius: 0.65, border: "1px solid", borderColor: "divider", objectFit: "contain" }}
+          />
+          <CheckCircleOutlineIcon
+            sx={{
+              position: "absolute",
+              right: -5,
+              bottom: -5,
+              fontSize: 10,
+              color: "success.main",
+              backgroundColor: "background.paper",
+              borderRadius: "50%"
+            }}
+          />
+        </Box>
+      ) : (
+        <StatusIcon status={status} />
+      )}
       <Typography variant="caption" sx={{ maxWidth: 170 }} noWrap>
         {name}
       </Typography>
@@ -901,6 +1006,29 @@ function toLocalFilePath(iconUrl: string): string | null {
   } catch {
     return null;
   }
+}
+
+async function resolveIconDataUrl(iconUrl: string): Promise<string | null> {
+  if (!iconUrl) {
+    return null;
+  }
+  if (!iconUrl.startsWith("file://")) {
+    return iconUrl;
+  }
+
+  const filePath = toLocalFilePath(iconUrl);
+  if (!filePath) {
+    return null;
+  }
+  return readIconDataUrl(filePath);
+}
+
+function omitIconCache(cache: Record<string, string | null>, ids: string[]): Record<string, string | null> {
+  if (ids.length === 0) {
+    return cache;
+  }
+  const idSet = new Set(ids);
+  return Object.fromEntries(Object.entries(cache).filter(([id]) => !idSet.has(id)));
 }
 
 export default App;
