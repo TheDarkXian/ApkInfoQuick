@@ -84,13 +84,61 @@ fn enrich_aapt_data(path: &Path, data: &mut ApkInfoData, warnings: &mut Vec<Stri
         return;
     };
 
-    let manifest = archive_reader::read_manifest_bytes(&mut archive)
+    let mut manifest = archive_reader::read_manifest_bytes(&mut archive)
         .ok()
         .and_then(|bytes| manifest_reader::parse_manifest(&bytes, warnings).ok())
         .unwrap_or_default();
 
+    if should_resolve_app_name_with_rust(&data.app_name) {
+        resource_resolver::resolve_app_name(&mut manifest, &mut archive, warnings);
+        if let Some(app_name) = manifest
+            .app_name
+            .clone()
+            .filter(|item| !item.trim().is_empty())
+        {
+            remove_app_name_source_warnings(warnings);
+            data.app_name = app_name;
+        }
+    }
+
     data.channel = channel_resolver::resolve(&manifest, path, &mut archive, warnings);
+    if !icon_url_points_to_existing_file(&data.icon_url) {
+        remove_icon_source_warnings(warnings);
+        let icon_url = icon_extractor::extract_best_icon(path, &manifest, &mut archive, warnings);
+        if !icon_url.is_empty() {
+            data.icon_url = icon_url;
+        }
+    }
     data.signers = signer_reader::extract_signers(path, &mut archive, warnings);
+}
+
+fn should_resolve_app_name_with_rust(app_name: &str) -> bool {
+    let trimmed = app_name.trim();
+    trimmed.is_empty()
+        || trimmed == "Unknown"
+        || trimmed.starts_with('@')
+        || trimmed.starts_with("0x")
+}
+
+fn icon_url_points_to_existing_file(icon_url: &str) -> bool {
+    let trimmed = icon_url.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let path = trimmed
+        .strip_prefix("file:///")
+        .map(|item| item.replace('/', "\\"))
+        .unwrap_or_else(|| trimmed.to_string());
+    Path::new(&path).is_file()
+}
+
+fn remove_icon_source_warnings(warnings: &mut Vec<String>) {
+    warnings.retain(|item| !item.starts_with("ICON_PICKED_"));
+}
+
+fn remove_app_name_source_warnings(warnings: &mut Vec<String>) {
+    warnings.retain(|item| !item.starts_with("APP_NAME_PICKED_"));
 }
 
 mod warnings {
@@ -439,11 +487,15 @@ mod aapt_parser {
         candidates.sort_by(|a, b| b.score.cmp(&a.score));
         for candidate in candidates {
             if candidate.path.ends_with(".xml") {
-                if let Some(path) = resolve_xml_icon(apk_path, aapt, &candidate.path) {
-                    if let Some(url) = extract_zip_icon(apk_path, &mut archive, &path) {
+                if let Some(entry_name) =
+                    resolve_xml_icon(apk_path, aapt, &mut archive, &candidate.path)
+                {
+                    if let Some(url) = extract_zip_icon(apk_path, &mut archive, &entry_name) {
                         super::push_warning(warnings, super::warnings::ICON_PICKED_AAPT_XMLTREE);
                         return url;
                     }
+                } else {
+                    super::push_warning(warnings, super::warnings::ICON_ADAPTIVE_XML_UNRESOLVED);
                 }
             } else if let Some(url) = extract_zip_icon(apk_path, &mut archive, &candidate.path) {
                 super::push_warning(warnings, super::warnings::ICON_PICKED_AAPT_BADGING);
@@ -453,7 +505,12 @@ mod aapt_parser {
         String::new()
     }
 
-    fn resolve_xml_icon(apk_path: &Path, aapt: &Path, icon_path: &str) -> Option<String> {
+    fn resolve_xml_icon(
+        apk_path: &Path,
+        aapt: &Path,
+        archive: &mut ZipArchive<File>,
+        icon_path: &str,
+    ) -> Option<String> {
         let xmltree = run_aapt_with_extra(aapt, &["d", "xmltree"], apk_path, icon_path).ok()?;
         let ids = parse_xmltree_refs(&xmltree);
         if ids.is_empty() {
@@ -462,7 +519,9 @@ mod aapt_parser {
         let resources = run_aapt(aapt, &["d", "resources"], apk_path).ok()?;
         for id in ids.into_iter().rev() {
             if let Some(name) = parse_resource_name(&resources, &id) {
-                return Some(format!("res/{name}.png"));
+                if let Some(entry_name) = best_matching_resource_entry(archive, &name) {
+                    return Some(entry_name);
+                }
             }
         }
         None
@@ -522,6 +581,24 @@ mod aapt_parser {
         let mut buf = Vec::new();
         entry.read_to_end(&mut buf).ok()?;
         write_icon_to_temp(apk_path, &entry_name, &buf)
+    }
+
+    fn best_matching_resource_entry(
+        archive: &mut ZipArchive<File>,
+        resource_name: &str,
+    ) -> Option<String> {
+        let mut best: Option<(String, i32)> = None;
+        for ext in ["webp", "png", "9.png"] {
+            let raw_path = format!("res/{resource_name}.{ext}");
+            if let Some(entry_name) = best_matching_entry(archive, &raw_path) {
+                let score =
+                    density_score(&entry_name) + if entry_name.ends_with(".webp") { 6 } else { 4 };
+                if best.as_ref().map(|(_, old)| score > *old).unwrap_or(true) {
+                    best = Some((entry_name, score));
+                }
+            }
+        }
+        best.map(|(entry_name, _)| entry_name)
     }
 
     fn best_matching_entry(archive: &mut ZipArchive<File>, raw_path: &str) -> Option<String> {
@@ -619,6 +696,16 @@ mod aapt_parser {
             .into_iter()
             .filter_map(|id| parse_resource_name(resources, &id))
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_best_matching_resource_entry(
+        apk_path: &Path,
+        resource_name: &str,
+    ) -> Option<String> {
+        let file = File::open(apk_path).ok()?;
+        let mut archive = ZipArchive::new(file).ok()?;
+        best_matching_resource_entry(&mut archive, resource_name)
     }
 }
 
@@ -1745,10 +1832,21 @@ mod icon_extractor {
             out.push(IconCandidate {
                 entry_name: entry.clone(),
                 strategy_name,
-                score: score_entry(entry, Some(icon_name), true),
+                score: score_entry(entry, Some(icon_name), true)
+                    + strategy_score_bonus(strategy_name),
             });
         }
         out
+    }
+
+    fn strategy_score_bonus(strategy_name: &str) -> i32 {
+        match strategy_name {
+            "ManifestPath" => 30,
+            "ResourceIdArsc" => 28,
+            "RoundIcon" => 18,
+            "AdaptiveXml" => 5,
+            _ => 0,
+        }
     }
 
     fn find_adaptive_icon_refs(
@@ -2594,6 +2692,114 @@ application-label-zh:'中文名'
     }
 
     #[test]
+    fn aapt_resource_entry_lookup_supports_webp_foreground() {
+        let apk = build_zip_with_name(
+            "aapt-webp-foreground.apk",
+            vec![
+                ("AndroidManifest.xml", b"<manifest />"),
+                ("res/mipmap-mdpi/wwq_foreground.webp", b"mdpi"),
+                ("res/mipmap-xxxhdpi/wwq_foreground.webp", b"xxxhdpi"),
+            ],
+        );
+
+        let entry = aapt_parser::test_best_matching_resource_entry(&apk, "mipmap/wwq_foreground")
+            .expect("find webp foreground");
+
+        assert_eq!(entry, "res/mipmap-xxxhdpi/wwq_foreground.webp");
+    }
+
+    #[test]
+    fn aapt_enrichment_falls_back_to_rust_resource_id_icon() {
+        let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="Demo" android:icon="@0x7f020000" />
+        </manifest>"#;
+        let arsc = build_minimal_arsc_drawable("ic_launcher");
+        let apk = build_zip_with_name(
+            "aapt-empty-icon-rust-resource-id.apk",
+            vec![
+                ("AndroidManifest.xml", manifest.as_bytes()),
+                ("resources.arsc", &arsc),
+                ("res/drawable-xxhdpi/ic_launcher.png", b"resource-id-icon"),
+            ],
+        );
+        let mut data = ApkInfoData {
+            package_name: "com.demo.app".to_string(),
+            app_name: "Demo".to_string(),
+            icon_url: String::new(),
+            min_sdk_version: 23,
+            target_sdk_version: 35,
+            compile_sdk_version: Some(35),
+            version_code: 42,
+            version_name: Some("4.2".to_string()),
+            permissions: Vec::new(),
+            signers: Vec::new(),
+            abis: Vec::new(),
+            channel: "unknown".to_string(),
+        };
+        let mut warnings = vec![super::warnings::APP_NAME_PICKED_AAPT_LABEL.to_string()];
+
+        enrich_aapt_data(&apk, &mut data, &mut warnings);
+
+        assert!(data.icon_url.ends_with(".png"));
+        assert!(
+            warnings
+                .iter()
+                .any(|item| item == "ICON_PICKED_RESOURCE_ID_ARSC"),
+            "warnings: {warnings:?}"
+        );
+        assert!(!warnings
+            .iter()
+            .any(|item| item == "ICON_PICKED_AAPT_BADGING"));
+    }
+
+    #[test]
+    fn aapt_enrichment_keeps_existing_valid_aapt_icon() {
+        let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="Demo" android:icon="@0x7f020000" />
+        </manifest>"#;
+        let arsc = build_minimal_arsc_drawable("ic_launcher");
+        let apk = build_zip_with_name(
+            "aapt-valid-icon-kept.apk",
+            vec![
+                ("AndroidManifest.xml", manifest.as_bytes()),
+                ("resources.arsc", &arsc),
+                ("res/drawable-xxhdpi/ic_launcher.png", b"rust-icon"),
+            ],
+        );
+        let existing_icon = apk.with_file_name("aapt-icon.png");
+        std::fs::write(&existing_icon, b"aapt-icon").expect("write existing icon");
+        let existing_icon_url = format!(
+            "file:///{}",
+            existing_icon.to_string_lossy().replace('\\', "/")
+        );
+        let mut data = ApkInfoData {
+            package_name: "com.demo.app".to_string(),
+            app_name: "Demo".to_string(),
+            icon_url: existing_icon_url.clone(),
+            min_sdk_version: 23,
+            target_sdk_version: 35,
+            compile_sdk_version: Some(35),
+            version_code: 42,
+            version_name: Some("4.2".to_string()),
+            permissions: Vec::new(),
+            signers: Vec::new(),
+            abis: Vec::new(),
+            channel: "unknown".to_string(),
+        };
+        let mut warnings = vec![super::warnings::ICON_PICKED_AAPT_BADGING.to_string()];
+
+        enrich_aapt_data(&apk, &mut data, &mut warnings);
+
+        assert_eq!(data.icon_url, existing_icon_url);
+        assert!(warnings
+            .iter()
+            .any(|item| item == "ICON_PICKED_AAPT_BADGING"));
+        assert!(!warnings
+            .iter()
+            .any(|item| item == "ICON_PICKED_RESOURCE_ID_ARSC"));
+    }
+
+    #[test]
     fn defaults_and_channel_priority_from_manifest() {
         let manifest = r#"<manifest package="com.demo.app" android:versionCode="100" xmlns:android="http://schemas.android.com/apk/res/android"> 
             <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34" />
@@ -2899,6 +3105,41 @@ application-label-zh:'中文名'
     }
 
     #[test]
+    fn compatible_webp_icon_is_preferred_over_adaptive_foreground_layer() {
+        let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:icon="@mipmap/wwq" />
+        </manifest>"#;
+        let adaptive = r#"<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+            <background android:drawable="@color/wwq_background" />
+            <foreground android:drawable="@mipmap/wwq_foreground" />
+        </adaptive-icon>"#;
+
+        let apk = build_zip_with_name(
+            "icon-compatible-webp.apk",
+            vec![
+                ("AndroidManifest.xml", manifest.as_bytes()),
+                ("res/mipmap-anydpi-v26/wwq.xml", adaptive.as_bytes()),
+                ("res/mipmap-xxxhdpi/wwq.webp", b"compatible-webp"),
+                (
+                    "res/mipmap-xxxhdpi/wwq_foreground.webp",
+                    b"foreground-layer-webp",
+                ),
+                (
+                    "res/values/wwq_background.xml",
+                    br##"<resources><color name="wwq_background">#E7B9A9</color></resources>"##,
+                ),
+            ],
+        );
+
+        let envelope = parse_apk_to_envelope(&apk);
+        assert!(envelope.success);
+        assert!(envelope.data.icon_url.ends_with(".webp"));
+        let icon_path = path_from_file_url(&envelope.data.icon_url);
+        let bytes = std::fs::read(icon_path).expect("read extracted icon");
+        assert_eq!(bytes, b"compatible-webp");
+    }
+
+    #[test]
     fn resource_id_icon_reference_can_be_resolved_from_arsc() {
         let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android">
             <application android:icon="@0x7f020000" />
@@ -3019,6 +3260,14 @@ application-label-zh:'中文名'
         target
     }
 
+    fn path_from_file_url(url: &str) -> PathBuf {
+        let raw = url
+            .strip_prefix("file:///")
+            .expect("icon url should be a file URL")
+            .replace('/', "\\");
+        PathBuf::from(raw)
+    }
+
     fn build_minimal_arsc_drawable(name: &str) -> Vec<u8> {
         build_minimal_arsc("drawable", 2, name)
     }
@@ -3063,7 +3312,9 @@ application-label-zh:'中文名'
             out
         }
 
-        let type_strings = build_string_pool(&[resource_type]);
+        let mut type_names = vec!["__unused"; type_id.saturating_sub(1) as usize];
+        type_names.push(resource_type);
+        let type_strings = build_string_pool(&type_names);
         let key_strings = build_string_pool(&[name]);
 
         let mut type_chunk = Vec::new();
