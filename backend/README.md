@@ -16,10 +16,20 @@ cd backend
 cargo run -- parse path\to\app.apk
 cargo run -- parse path\to\app.apk --compact
 cargo run -- parse path\to\app.apk --pretty
+cargo run -- parse path\to\app.apk --text
+cargo run -- parse path\to\app.apk --export-icon .\icons
+cargo run -- parse .\samples --recursive --out result.json
+cargo run -- doctor
 ```
 
 - `--pretty`: pretty JSON (default behavior)
 - `--compact`: single-line JSON
+- `--text`: human-readable text output
+- `--recursive`: recursively scan directories for `.apk` files
+- `--out <file>`: write output to a file instead of stdout
+- `--export-icon <dir>`: copy the resolved icon file into the chosen directory
+- `doctor`: reports the resolved `aapt` path and bundled tools directory
+- Single-file JSON output remains the raw `Envelope`; multi-file output is an array of `{ path, envelope, iconExportedTo }`
 
 ## Channel priority
 1. Manifest `meta-data` (`UMENG_CHANNEL`, `CHANNEL`, ...)
