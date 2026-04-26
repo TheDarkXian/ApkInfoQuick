@@ -212,7 +212,7 @@ function App() {
   }
 
   function retryCurrent() {
-    if (!activeTab || activeTab.ext !== "apk") {
+    if (!activeTab) {
       return;
     }
 
@@ -554,15 +554,11 @@ function App() {
           </Paper>
         ) : (
           <Stack spacing={0.55}>
-            {activeTab.ext === "aab" ? (
-              <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
-                <Alert severity="info">占位：AAB 暂不解析，已保留路径与标签。</Alert>
-              </Paper>
-            ) : activeTab.status === "parsing" ? (
+            {activeTab.status === "parsing" ? (
               <Paper variant="outlined" sx={{ p: SECTION_PADDING }}>
                 <Stack direction="row" spacing={0.8} alignItems="center">
                   <CircularProgress size={16} />
-                  <Typography variant="body2">正在按队列顺序解析该 APK...</Typography>
+                  <Typography variant="body2">正在按队列顺序解析该文件...</Typography>
                 </Stack>
               </Paper>
             ) : activeTab.status === "error" && !activeData ? (
@@ -881,7 +877,7 @@ function SourcePanel({ tab, onRetry }: { tab: FileTab; onRetry: () => void }) {
             </Typography>
           </Tooltip>
         </Stack>
-        {tab.ext === "apk" && tab.status === "error" && (
+        {tab.status === "error" && (
           <Button size="small" variant="outlined" onClick={onRetry}>
             重试
           </Button>

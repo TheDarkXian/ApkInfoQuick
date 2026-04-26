@@ -1,6 +1,11 @@
 ﻿export const WARNING_LABELS: Record<string, string> = {
   AAPT_NOT_FOUND_FALLBACK_USED: "未找到 aapt，已使用内置解析兜底",
   AAPT_BADGING_FAILED_FALLBACK_USED: "aapt 解析失败，已使用内置解析兜底",
+  AAB_CONVERTED_BY_BUNDLETOOL: "AAB 已通过 bundletool 转换为 universal APK",
+  AAB_BUNDLETOOL_NOT_FOUND: "未找到 bundletool，无法解析 AAB",
+  AAB_JAVA_NOT_FOUND: "未找到 Java，无法运行 bundletool",
+  AAB_BUNDLETOOL_FAILED: "bundletool 转换 AAB 失败",
+  AAB_UNIVERSAL_APK_NOT_FOUND: "bundletool 输出中未找到 universal APK",
   CHANNEL_NOT_FOUND: "未检测到渠道信息",
   ICON_NOT_FOUND: "未找到可提取图标",
   ICON_MANIFEST_REF_UNRESOLVED: "Manifest 图标引用未能解析到资源文件",

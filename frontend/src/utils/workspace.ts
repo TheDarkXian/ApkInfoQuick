@@ -81,16 +81,14 @@ export function createTabsFromPaths(
       name: getFileName(path),
       path,
       ext,
-      status: ext === "aab" ? "placeholder" : "pending",
+      status: "pending",
       envelope: null,
-      localError: ext === "aab" ? "AAB 当前仅占位，暂不解析。" : null,
+      localError: null,
       createdAt: now
     };
 
     createdTabs.push(tab);
-    if (ext === "apk") {
-      jobs.push({ id, path });
-    }
+    jobs.push({ id, path });
   });
 
   return { createdTabs, jobs, summary };

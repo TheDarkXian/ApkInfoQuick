@@ -16,7 +16,7 @@ function existing(path: string): FileTab {
 }
 
 describe("createTabsFromPaths", () => {
-  it("creates apk jobs in order and keeps aab as placeholder", () => {
+  it("creates apk and aab jobs in order", () => {
     const result = createTabsFromPaths(
       ["D:/a.apk", "D:/b.aab", "D:/c.apk"],
       [],
@@ -24,8 +24,8 @@ describe("createTabsFromPaths", () => {
       123
     );
     expect(result.createdTabs.map((item) => item.name)).toEqual(["a.apk", "b.aab", "c.apk"]);
-    expect(result.createdTabs.map((item) => item.status)).toEqual(["pending", "placeholder", "pending"]);
-    expect(result.jobs.map((item) => item.path)).toEqual(["D:/a.apk", "D:/c.apk"]);
+    expect(result.createdTabs.map((item) => item.status)).toEqual(["pending", "pending", "pending"]);
+    expect(result.jobs.map((item) => item.path)).toEqual(["D:/a.apk", "D:/b.aab", "D:/c.apk"]);
   });
 
   it("deduplicates by path (case-insensitive) and counts unsupported", () => {

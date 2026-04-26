@@ -71,10 +71,24 @@ fn configure_bundled_aapt(app: &tauri::App) {
     }
 }
 
+fn configure_bundled_bundletool(app: &tauri::App) {
+    let Ok(path) = app
+        .path()
+        .resolve("tools/android/bundletool.jar", BaseDirectory::Resource)
+    else {
+        return;
+    };
+
+    if path.is_file() {
+        std::env::set_var("APK_INFO_BUNDLETOOL", path);
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
             configure_bundled_aapt(app);
+            configure_bundled_bundletool(app);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

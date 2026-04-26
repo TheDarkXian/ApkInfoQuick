@@ -6,6 +6,7 @@ describe("warning labels", () => {
     expect(toWarningLabel("CHANNEL_NOT_FOUND")).toBe("未检测到渠道信息");
     expect(toWarningLabel("SIGNATURE_PARTIAL")).toBe("签名信息为尽力解析，可能不完整");
     expect(toWarningLabel("AAPT_NOT_FOUND_FALLBACK_USED")).toBe("未找到 aapt，已使用内置解析兜底");
+    expect(toWarningLabel("AAB_CONVERTED_BY_BUNDLETOOL")).toBe("AAB 已通过 bundletool 转换为 universal APK");
     expect(toWarningLabel("APP_NAME_PICKED_AAPT_LABEL")).toBe("应用名来源：aapt label");
   });
 
@@ -28,6 +29,11 @@ describe("warning labels", () => {
         "APP_NAME_PICKED_STRING_REF",
         "AAPT_BADGING_FAILED_FALLBACK_USED",
         "AAPT_NOT_FOUND_FALLBACK_USED",
+        "AAB_BUNDLETOOL_FAILED",
+        "AAB_BUNDLETOOL_NOT_FOUND",
+        "AAB_CONVERTED_BY_BUNDLETOOL",
+        "AAB_JAVA_NOT_FOUND",
+        "AAB_UNIVERSAL_APK_NOT_FOUND",
         "CHANNEL_NOT_FOUND",
         "ICON_ADAPTIVE_XML_UNRESOLVED",
         "ICON_CANDIDATES_EMPTY",
