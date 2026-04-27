@@ -36,7 +36,7 @@ import {
 } from "@mui/material";
 import { exportIconWithDialog, parseApk, pickFiles, readIconDataUrl } from "./services/tauri";
 import { isIconPickedWarning, toWarningLabel } from "./constants/warnings";
-import { ApkInfoData } from "./types/apk";
+import { ApkInfoData, Signer } from "./types/apk";
 import { FileTab, TabStatus } from "./types/tab";
 import { renderCopyJson, renderCopyText } from "./utils/copy";
 import { createTabsFromPaths, ParseJob } from "./utils/workspace";
@@ -45,6 +45,22 @@ const EMPTY_TEXT = "无数据";
 const MAX_TABS = 10;
 const SECTION_PADDING = 0.55;
 const COMPACT_LIST_ITEM_SX = { py: 0, minHeight: 20 };
+const LONG_VALUE_TYPOGRAPHY_PROPS = {
+  variant: "body2" as const,
+  sx: {
+    maxWidth: "100%",
+    overflowWrap: "anywhere",
+    wordBreak: "break-all",
+    lineHeight: 1.25
+  }
+};
+const HASH_VALUE_TYPOGRAPHY_PROPS = {
+  ...LONG_VALUE_TYPOGRAPHY_PROPS,
+  sx: {
+    ...LONG_VALUE_TYPOGRAPHY_PROPS.sx,
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+  }
+};
 const DIAGNOSTIC_WARNING_CODES = new Set([
   "AAPT_NOT_FOUND_FALLBACK_USED",
   "AAPT_BADGING_FAILED_FALLBACK_USED",
@@ -69,7 +85,7 @@ function App() {
   const [tabs, setTabs] = useState<FileTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [parseQueue, setParseQueue] = useState<ParseJob[]>([]);
-  const [isParsing, setIsParsing] = useState(false);
+  const [currentParseJob, setCurrentParseJob] = useState<ParseJob | null>(null);
   const [dragging, setDragging] = useState(false);
   const [toast, setToast] = useState<ToastState>({
     open: false,
@@ -81,6 +97,8 @@ function App() {
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [signerExpanded, setSignerExpanded] = useState(false);
   const tabsRef = useRef<FileTab[]>([]);
+  const parseQueueRef = useRef<ParseJob[]>([]);
+  const currentParseJobRef = useRef<ParseJob | null>(null);
 
   const activeTab = useMemo(
     () => tabs.find((item) => item.id === activeTabId) ?? null,
@@ -95,6 +113,25 @@ function App() {
     setToast((prev) => ({ ...prev, open: false }));
   }
 
+  const setTabsSynced = useCallback((updater: (prev: FileTab[]) => FileTab[]) => {
+    const next = updater(tabsRef.current);
+    tabsRef.current = next;
+    setTabs(next);
+    return next;
+  }, []);
+
+  const setParseQueueSynced = useCallback((updater: (prev: ParseJob[]) => ParseJob[]) => {
+    const next = updater(parseQueueRef.current);
+    parseQueueRef.current = next;
+    setParseQueue(next);
+    return next;
+  }, []);
+
+  const setCurrentParseJobSynced = useCallback((job: ParseJob | null) => {
+    currentParseJobRef.current = job;
+    setCurrentParseJob(job);
+  }, []);
+
   const addFiles = useCallback(
     (paths: string[]) => {
       if (paths.length === 0) {
@@ -102,6 +139,7 @@ function App() {
       }
 
       const currentTabs = tabsRef.current;
+      const wasBusy = Boolean(currentParseJobRef.current) || parseQueueRef.current.length > 0;
       const { createdTabs, jobs, summary } = createTabsFromPaths(paths, currentTabs, MAX_TABS);
 
       if (summary.unsupportedCount > 0) {
@@ -120,14 +158,16 @@ function App() {
       }
 
       const nextTabs = [...currentTabs, ...createdTabs];
-      tabsRef.current = nextTabs;
-      setTabs(nextTabs);
+      setTabsSynced(() => nextTabs);
       setActiveTabId((prev) => prev ?? createdTabs[0].id);
       if (jobs.length > 0) {
-        setParseQueue((prev) => [...prev, ...jobs]);
+        setParseQueueSynced((prev) => [...prev, ...jobs]);
+        if (wasBusy) {
+          showToast(`已加入解析队列：${jobs.length} 个文件。`, "info");
+        }
       }
     },
-    [showToast]
+    [setParseQueueSynced, setTabsSynced, showToast]
   );
 
   async function onPickFile() {
@@ -167,10 +207,9 @@ function App() {
     }
 
     const closingTabId = activeTabId;
-    setTabs((prev) => {
+    setTabsSynced((prev) => {
       const index = prev.findIndex((item) => item.id === closingTabId);
       const next = prev.filter((item) => item.id !== closingTabId);
-      tabsRef.current = next;
 
       setActiveTabId(() => {
         if (next.length === 0) {
@@ -183,7 +222,7 @@ function App() {
       return next;
     });
 
-    setParseQueue((prev) => prev.filter((job) => job.id !== closingTabId));
+    setParseQueueSynced((prev) => prev.filter((job) => job.id !== closingTabId));
     setTabIconUrls((prev) => omitIconCache(prev, [closingTabId]));
   }
 
@@ -191,12 +230,11 @@ function App() {
     if (!activeTabId) {
       return;
     }
-    setTabs((prev) => {
+    setTabsSynced((prev) => {
       const next = prev.filter((item) => item.id === activeTabId);
-      tabsRef.current = next;
       return next;
     });
-    setParseQueue((prev) => prev.filter((job) => job.id === activeTabId));
+    setParseQueueSynced((prev) => prev.filter((job) => job.id === activeTabId));
     setTabIconUrls((prev) => {
       const kept = activeTabId ? prev[activeTabId] : undefined;
       return activeTabId && kept !== undefined ? { [activeTabId]: kept } : {};
@@ -204,10 +242,9 @@ function App() {
   }
 
   function clearAllTabs() {
-    tabsRef.current = [];
-    setTabs([]);
+    setTabsSynced(() => []);
     setActiveTabId(null);
-    setParseQueue([]);
+    setParseQueueSynced(() => []);
     setTabIconUrls({});
   }
 
@@ -216,7 +253,7 @@ function App() {
       return;
     }
 
-    setTabs((prev) => {
+    setTabsSynced((prev) => {
       const next: FileTab[] = prev.map((item): FileTab =>
         item.id === activeTab.id
           ? {
@@ -226,11 +263,10 @@ function App() {
             }
           : item
       );
-      tabsRef.current = next;
       return next;
     });
     setTabIconUrls((prev) => omitIconCache(prev, [activeTab.id]));
-    setParseQueue((prev) => [...prev, { id: activeTab.id, path: activeTab.path }]);
+    setParseQueueSynced((prev) => [...prev, { id: activeTab.id, path: activeTab.path }]);
   }
 
   async function copyCurrentText() {
@@ -264,6 +300,10 @@ function App() {
   useEffect(() => {
     tabsRef.current = tabs;
   }, [tabs]);
+
+  useEffect(() => {
+    parseQueueRef.current = parseQueue;
+  }, [parseQueue]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -302,15 +342,18 @@ function App() {
   }, [addFiles]);
 
   useEffect(() => {
-    if (isParsing || parseQueue.length === 0) {
+    if (currentParseJob || parseQueue.length === 0) {
       return;
     }
 
-    const currentJob = parseQueue[0];
-    setParseQueue((prev) => prev.slice(1));
-    setIsParsing(true);
+    const currentJob = parseQueueRef.current[0];
+    if (!currentJob) {
+      return;
+    }
+    setParseQueueSynced((prev) => prev.slice(1));
+    setCurrentParseJobSynced(currentJob);
 
-    setTabs((prev) => {
+    setTabsSynced((prev) => {
       const next: FileTab[] = prev.map((item): FileTab =>
         item.id === currentJob.id
           ? {
@@ -320,14 +363,13 @@ function App() {
             }
           : item
       );
-      tabsRef.current = next;
       return next;
     });
     setTabIconUrls((prev) => omitIconCache(prev, [currentJob.id]));
 
     void parseApk(currentJob.path)
       .then((result) => {
-        setTabs((prev) => {
+        setTabsSynced((prev) => {
           if (!prev.some((item) => item.id === currentJob.id)) {
             return prev;
           }
@@ -342,12 +384,11 @@ function App() {
               localError: result.envelope.success ? null : result.envelope.errorMessage || "解析失败"
             };
           });
-          tabsRef.current = next;
           return next;
         });
       })
       .catch((error) => {
-        setTabs((prev) => {
+        setTabsSynced((prev) => {
           if (!prev.some((item) => item.id === currentJob.id)) {
             return prev;
           }
@@ -361,14 +402,13 @@ function App() {
               localError: error instanceof Error ? error.message : "解析请求失败"
             };
           });
-          tabsRef.current = next;
           return next;
         });
       })
       .finally(() => {
-        setIsParsing(false);
+        setCurrentParseJobSynced(null);
       });
-  }, [isParsing, parseQueue]);
+  }, [currentParseJob, parseQueue, setCurrentParseJobSynced, setParseQueueSynced, setTabsSynced]);
 
   useEffect(() => {
     if (!activeTabId && tabs.length > 0) {
@@ -419,12 +459,14 @@ function App() {
   }, [tabs, tabIconUrls]);
 
   const activeData = activeTab?.envelope?.data ?? null;
+  const queueTabs = tabs.filter((tab) => tab.status === "pending" || tab.status === "parsing" || tab.status === "error");
   const rawIconUrl = activeData?.iconUrl || "";
   const activeResolvedIconUrl = (activeTabId ? tabIconUrls[activeTabId] : null) || resolvedIconUrl;
   const iconAvailable = Boolean(activeResolvedIconUrl);
-  const hasSignaturePartialRisk =
+  const hasSignaturePartialRisk = Boolean(
     activeTab?.envelope?.warnings.includes("SIGNATURE_PARTIAL") ||
-    activeTab?.envelope?.warnings.includes("SIGNATURE_BLOCK_DETECTED_UNPARSED");
+      activeTab?.envelope?.warnings.includes("SIGNATURE_BLOCK_DETECTED_UNPARSED")
+  );
   const allWarnings = activeTab?.envelope?.warnings ?? [];
   const iconPickedWarning = allWarnings.find((item) => isIconPickedWarning(item)) ?? "";
   const iconResolvedSuccessfully = Boolean(rawIconUrl && activeResolvedIconUrl);
@@ -441,8 +483,7 @@ function App() {
     return iconResolvedSuccessfully;
   });
   const primaryWarnings = allWarnings.filter((item) => !isIconPickedWarning(item) && !diagnosticWarnings.includes(item));
-  const signerDefaultExpanded =
-    Boolean(activeData && activeData.signers.length > 0) && !hasSignaturePartialRisk;
+  const signerDefaultExpanded = Boolean(activeData?.signers.some(hasMeaningfulSignerValue));
 
   useEffect(() => {
     let active = true;
@@ -545,6 +586,14 @@ function App() {
             ))}
           </Tabs>
         </Paper>
+
+        {queueTabs.length > 0 && (
+          <TaskQueuePanel
+            tabs={queueTabs}
+            currentJobId={currentParseJob?.id ?? null}
+            onActivate={(id) => setActiveTabId(id)}
+          />
+        )}
 
         {!activeTab ? (
           <Paper variant="outlined" sx={{ p: 1.2 }}>
@@ -693,7 +742,7 @@ function App() {
                         </Button>
                       </Stack>
                       <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.35 }}>
-                        {activeData.signers.length === 0 ? "签名：无可用信息" : hasSignaturePartialRisk ? "签名：解析不完整" : `签名：${activeData.signers.length} 个`}
+                        {getSignerSummary(activeData.signers, hasSignaturePartialRisk)}
                       </Typography>
                       {signerExpanded && (
                         <Stack spacing={0.55} sx={{ mt: 0.45 }}>
@@ -719,15 +768,15 @@ function App() {
                                     </ListItem>
                                     <Divider component="li" />
                                     <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                                      <ListItemText primary="certSha256" secondary={signer.certSha256 || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
+                                      <ListItemText primary="certSha256" secondary={signer.certSha256 || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={HASH_VALUE_TYPOGRAPHY_PROPS} />
                                     </ListItem>
                                     <Divider component="li" />
                                     <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                                      <ListItemText primary="issuer" secondary={signer.issuer || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
+                                      <ListItemText primary="issuer" secondary={signer.issuer || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={LONG_VALUE_TYPOGRAPHY_PROPS} />
                                     </ListItem>
                                     <Divider component="li" />
                                     <ListItem sx={COMPACT_LIST_ITEM_SX}>
-                                      <ListItemText primary="subject" secondary={signer.subject || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={{ variant: "body2" }} />
+                                      <ListItemText primary="subject" secondary={signer.subject || EMPTY_TEXT} primaryTypographyProps={{ variant: "caption" }} secondaryTypographyProps={LONG_VALUE_TYPOGRAPHY_PROPS} />
                                     </ListItem>
                                   </List>
                                 </Paper>
@@ -809,6 +858,75 @@ function IconPanel({
         <Button size="small" variant="outlined" startIcon={<DownloadIcon />} disabled={!canExport} onClick={onExport} sx={{ mt: "auto" }}>
           导出
         </Button>
+      </Stack>
+    </Paper>
+  );
+}
+
+function TaskQueuePanel({
+  tabs,
+  currentJobId,
+  onActivate
+}: {
+  tabs: FileTab[];
+  currentJobId: string | null;
+  onActivate: (id: string) => void;
+}) {
+  const parsingTabs = tabs.filter((tab) => tab.status === "parsing" || tab.id === currentJobId);
+  const pendingTabs = tabs.filter((tab) => tab.status === "pending");
+  const errorTabs = tabs.filter((tab) => tab.status === "error");
+
+  return (
+    <Paper variant="outlined" sx={{ p: 0.5 }}>
+      <Stack direction={{ xs: "column", md: "row" }} spacing={0.55} alignItems={{ xs: "stretch", md: "center" }}>
+        <Stack direction="row" spacing={0.45} alignItems="center" sx={{ flex: "0 0 auto" }}>
+          <HourglassTopIcon sx={{ fontSize: 15, color: parsingTabs.length ? "warning.main" : "text.secondary" }} />
+          <Typography variant="caption" sx={{ fontWeight: 700 }}>
+            解析队列
+          </Typography>
+          <Chip size="small" label={`进行中 ${parsingTabs.length}`} color={parsingTabs.length ? "warning" : "default"} />
+          <Chip size="small" label={`等待 ${pendingTabs.length}`} />
+          {errorTabs.length > 0 && <Chip size="small" label={`失败 ${errorTabs.length}`} color="error" variant="outlined" />}
+        </Stack>
+
+        <Stack direction="row" spacing={0.4} useFlexGap flexWrap="wrap" sx={{ minWidth: 0 }}>
+          {parsingTabs.map((tab) => (
+            <Tooltip key={`parsing-${tab.id}`} title={tab.path}>
+              <Chip
+                size="small"
+                color="warning"
+                variant="outlined"
+                icon={<CircularProgress size={10} />}
+                label={`解析中：${tab.name}`}
+                onClick={() => onActivate(tab.id)}
+                sx={{ maxWidth: 230 }}
+              />
+            </Tooltip>
+          ))}
+          {pendingTabs.slice(0, 6).map((tab) => (
+            <Tooltip key={`pending-${tab.id}`} title={tab.path}>
+              <Chip
+                size="small"
+                label={`等待：${tab.name}`}
+                onClick={() => onActivate(tab.id)}
+                sx={{ maxWidth: 210 }}
+              />
+            </Tooltip>
+          ))}
+          {pendingTabs.length > 6 && <Chip size="small" label={`+${pendingTabs.length - 6}`} />}
+          {errorTabs.slice(0, 3).map((tab) => (
+            <Tooltip key={`error-${tab.id}`} title={tab.localError || tab.path}>
+              <Chip
+                size="small"
+                color="error"
+                variant="outlined"
+                label={`失败：${tab.name}`}
+                onClick={() => onActivate(tab.id)}
+                sx={{ maxWidth: 210 }}
+              />
+            </Tooltip>
+          ))}
+        </Stack>
       </Stack>
     </Paper>
   );
@@ -974,6 +1092,24 @@ function statusColor(status: TabStatus): "default" | "success" | "warning" | "er
     default:
       return "default";
   }
+}
+
+function hasMeaningfulSignerValue(signer: Signer): boolean {
+  return [signer.scheme, signer.certSha256, signer.issuer, signer.subject, signer.validFrom, signer.validTo].some((value) =>
+    isMeaningfulText(value)
+  );
+}
+
+function isMeaningfulText(value: string): boolean {
+  const normalized = value.trim().toLowerCase();
+  return Boolean(normalized && normalized !== "unknown" && normalized !== EMPTY_TEXT.toLowerCase());
+}
+
+function getSignerSummary(signers: Signer[], hasPartialRisk: boolean): string {
+  if (signers.length === 0 || !signers.some(hasMeaningfulSignerValue)) {
+    return "签名：无可用信息";
+  }
+  return hasPartialRisk ? `签名：${signers.length} 个，部分字段未识别` : `签名：${signers.length} 个`;
 }
 
 function toLocalFilePath(iconUrl: string): string | null {
