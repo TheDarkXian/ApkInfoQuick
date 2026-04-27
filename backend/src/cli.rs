@@ -35,6 +35,10 @@ pub enum Commands {
         #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
         compact: bool,
 
+        /// Disable progress output on stderr.
+        #[arg(long, action = ArgAction::SetTrue, default_value_t = false)]
+        quiet: bool,
+
         /// Write output to a file instead of stdout.
         #[arg(short, long)]
         out: Option<PathBuf>,
@@ -42,6 +46,10 @@ pub enum Commands {
         /// Export resolved icons to this directory.
         #[arg(long)]
         export_icon: Option<PathBuf>,
+
+        /// Use a custom text template when --text is enabled.
+        #[arg(long)]
+        template: Option<PathBuf>,
     },
 
     /// Check CLI runtime and bundled Android tools.
