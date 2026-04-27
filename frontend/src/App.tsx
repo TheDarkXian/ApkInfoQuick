@@ -587,14 +587,6 @@ function App() {
           </Tabs>
         </Paper>
 
-        {queueTabs.length > 0 && (
-          <TaskQueuePanel
-            tabs={queueTabs}
-            currentJobId={currentParseJob?.id ?? null}
-            onActivate={(id) => setActiveTabId(id)}
-          />
-        )}
-
         {!activeTab ? (
           <Paper variant="outlined" sx={{ p: 1.2 }}>
             <Typography variant="body2" color="text.secondary">
@@ -792,6 +784,13 @@ function App() {
               )
             )}
             <SourcePanel tab={activeTab} onRetry={retryCurrent} />
+            {queueTabs.length > 0 && (
+              <TaskQueuePanel
+                tabs={queueTabs}
+                currentJobId={currentParseJob?.id ?? null}
+                onActivate={(id) => setActiveTabId(id)}
+              />
+            )}
           </Stack>
         )}
       </Stack>

@@ -1,11 +1,20 @@
-use apk_info_backend::model::ApkInfoEnvelope;
+use apk_info_backend::model::{ApkInfoData, ApkInfoEnvelope};
 use apk_info_backend::parser::parse_apk_tauri;
 use base64::Engine;
 use tauri::{path::BaseDirectory, Manager};
 
 #[tauri::command]
-fn parse_apk(file_path: String) -> ApkInfoEnvelope {
-    parse_apk_tauri(file_path)
+async fn parse_apk(file_path: String) -> ApkInfoEnvelope {
+    tauri::async_runtime::spawn_blocking(move || parse_apk_tauri(file_path))
+        .await
+        .unwrap_or_else(|err| {
+            ApkInfoEnvelope::err(
+                "PARSE_WORKER_FAILED",
+                format!("解析任务执行失败: {err}"),
+                ApkInfoData::placeholder(),
+                Vec::new(),
+            )
+        })
 }
 
 #[tauri::command]
