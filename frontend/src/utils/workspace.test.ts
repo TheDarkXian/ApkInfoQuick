@@ -11,6 +11,8 @@ function existing(path: string): FileTab {
     status: "success",
     envelope: null,
     localError: null,
+    signerStatus: "success",
+    signerError: null,
     createdAt: 1
   };
 }

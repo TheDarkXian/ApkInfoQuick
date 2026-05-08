@@ -12,10 +12,10 @@ use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
 use crate::error::BackendError;
-use crate::model::{ApkInfoData, ApkInfoEnvelope, SignerInfo};
+use crate::model::{ApkInfoData, ApkInfoEnvelope, SignerInfo, SignerParseResult};
 
 pub fn parse_apk_to_envelope(path: &Path) -> ApkInfoEnvelope {
-    match parse_apk(path) {
+    match parse_apk(path, true) {
         Ok((data, warnings)) => ApkInfoEnvelope::ok(data, warnings),
         Err((err, warnings)) => ApkInfoEnvelope::err(
             err.code(),
@@ -28,27 +28,62 @@ pub fn parse_apk_to_envelope(path: &Path) -> ApkInfoEnvelope {
 
 pub fn parse_apk_tauri(file_path: String) -> ApkInfoEnvelope {
     let path = PathBuf::from(file_path);
-    parse_apk_to_envelope(&path)
+    match parse_apk(&path, false) {
+        Ok((data, warnings)) => ApkInfoEnvelope::ok(data, warnings),
+        Err((err, warnings)) => ApkInfoEnvelope::err(
+            err.code(),
+            sanitize_error_message(err.to_string(), &path),
+            ApkInfoData::placeholder(),
+            warnings,
+        ),
+    }
 }
 
-fn parse_apk(path: &Path) -> Result<(ApkInfoData, Vec<String>), (BackendError, Vec<String>)> {
+pub fn parse_signers_tauri(file_path: String) -> SignerParseResult {
+    let path = PathBuf::from(file_path);
+    match parse_signers(&path) {
+        Ok((signers, warnings)) => SignerParseResult::ok(signers, warnings),
+        Err((err, mut warnings)) => {
+            push_warning(&mut warnings, warnings::SIGNATURE_PARSE_FAILED);
+            SignerParseResult::err(
+                err.code(),
+                sanitize_error_message(err.to_string(), &path),
+                warnings,
+            )
+        }
+    }
+}
+
+fn parse_apk(
+    path: &Path,
+    include_signers: bool,
+) -> Result<(ApkInfoData, Vec<String>), (BackendError, Vec<String>)> {
     input_validation::validate_input(path).map_err(|e| (e, Vec::new()))?;
     if is_aab_path(path) {
-        return parse_aab_via_bundletool(path);
+        return parse_aab_via_bundletool(path, include_signers);
     }
 
     match aapt_parser::parse(path) {
         Ok(mut parsed) => {
-            enrich_aapt_data(path, &mut parsed.data, &mut parsed.warnings);
+            enrich_aapt_data(
+                path,
+                &mut parsed.data,
+                &mut parsed.warnings,
+                include_signers,
+            );
+            if !include_signers {
+                push_warning(&mut parsed.warnings, warnings::SIGNATURE_DEFERRED);
+                parsed.data.signers = Vec::new();
+            }
             return Ok((parsed.data, parsed.warnings));
         }
         Err(aapt_parser::AaptError::NotFound) => {
-            let (data, mut warnings) = parse_apk_rust(path)?;
+            let (data, mut warnings) = parse_apk_rust(path, include_signers)?;
             push_warning(&mut warnings, warnings::AAPT_NOT_FOUND_FALLBACK_USED);
             return Ok((data, warnings));
         }
         Err(_) => {
-            let (data, mut warnings) = parse_apk_rust(path)?;
+            let (data, mut warnings) = parse_apk_rust(path, include_signers)?;
             push_warning(&mut warnings, warnings::AAPT_BADGING_FAILED_FALLBACK_USED);
             return Ok((data, warnings));
         }
@@ -57,6 +92,7 @@ fn parse_apk(path: &Path) -> Result<(ApkInfoData, Vec<String>), (BackendError, V
 
 fn parse_aab_via_bundletool(
     path: &Path,
+    include_signers: bool,
 ) -> Result<(ApkInfoData, Vec<String>), (BackendError, Vec<String>)> {
     let mut warnings = Vec::new();
     let universal_apk = aab_parser::convert_to_universal_apk(path, &mut warnings).map_err(|e| {
@@ -66,10 +102,11 @@ fn parse_aab_via_bundletool(
         (e, warnings.clone())
     })?;
 
-    let (data, apk_warnings) = parse_apk(&universal_apk).map_err(|(err, mut inner_warnings)| {
-        warnings.append(&mut inner_warnings);
-        (err, warnings.clone())
-    })?;
+    let (data, apk_warnings) =
+        parse_apk(&universal_apk, include_signers).map_err(|(err, mut inner_warnings)| {
+            warnings.append(&mut inner_warnings);
+            (err, warnings.clone())
+        })?;
     push_warning(&mut warnings, warnings::AAB_CONVERTED_BY_BUNDLETOOL);
     for warning in apk_warnings {
         push_warning_owned(&mut warnings, warning);
@@ -84,7 +121,10 @@ fn is_aab_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn parse_apk_rust(path: &Path) -> Result<(ApkInfoData, Vec<String>), (BackendError, Vec<String>)> {
+fn parse_apk_rust(
+    path: &Path,
+    include_signers: bool,
+) -> Result<(ApkInfoData, Vec<String>), (BackendError, Vec<String>)> {
     let file = File::open(path).map_err(|_| (BackendError::ApkOpenFailed, Vec::new()))?;
     let mut archive =
         ZipArchive::new(file).map_err(|_| (BackendError::ApkOpenFailed, Vec::new()))?;
@@ -102,13 +142,23 @@ fn parse_apk_rust(path: &Path) -> Result<(ApkInfoData, Vec<String>), (BackendErr
     let abis = archive_reader::infer_abis(&mut archive);
     let channel = channel_resolver::resolve(&manifest, path, &mut archive, &mut warnings);
     let icon_url = icon_extractor::extract_best_icon(path, &manifest, &mut archive, &mut warnings);
-    let signers = signer_reader::extract_signers(path, &mut archive, &mut warnings);
+    let signers = if include_signers {
+        signer_reader::extract_signers(path, &mut archive, &mut warnings)
+    } else {
+        push_warning(&mut warnings, warnings::SIGNATURE_DEFERRED);
+        Vec::new()
+    };
 
     let data = envelope_mapper::map_to_data(path, manifest, abis, channel, icon_url, signers);
     Ok((data, warnings))
 }
 
-fn enrich_aapt_data(path: &Path, data: &mut ApkInfoData, warnings: &mut Vec<String>) {
+fn enrich_aapt_data(
+    path: &Path,
+    data: &mut ApkInfoData,
+    warnings: &mut Vec<String>,
+    include_signers: bool,
+) {
     let Ok(file) = File::open(path) else {
         return;
     };
@@ -141,7 +191,51 @@ fn enrich_aapt_data(path: &Path, data: &mut ApkInfoData, warnings: &mut Vec<Stri
             data.icon_url = icon_url;
         }
     }
-    data.signers = signer_reader::extract_signers(path, &mut archive, warnings);
+    if include_signers {
+        data.signers = signer_reader::extract_signers(path, &mut archive, warnings);
+    } else {
+        data.signers = Vec::new();
+        push_warning(warnings, warnings::SIGNATURE_DEFERRED);
+    }
+}
+
+fn parse_signers(
+    path: &Path,
+) -> Result<(Vec<SignerInfo>, Vec<String>), (BackendError, Vec<String>)> {
+    input_validation::validate_input(path).map_err(|e| (e, Vec::new()))?;
+    if is_aab_path(path) {
+        let mut warnings = Vec::new();
+        let universal_apk =
+            aab_parser::convert_to_universal_apk(path, &mut warnings).map_err(|e| {
+                if warnings.is_empty() {
+                    push_warning(&mut warnings, warnings::AAB_BUNDLETOOL_FAILED);
+                }
+                (e, warnings.clone())
+            })?;
+        let (signers, apk_warnings) =
+            parse_signers_from_apk(&universal_apk).map_err(|(err, mut inner_warnings)| {
+                warnings.append(&mut inner_warnings);
+                (err, warnings.clone())
+            })?;
+        push_warning(&mut warnings, warnings::AAB_CONVERTED_BY_BUNDLETOOL);
+        for warning in apk_warnings {
+            push_warning_owned(&mut warnings, warning);
+        }
+        return Ok((signers, warnings));
+    }
+
+    parse_signers_from_apk(path)
+}
+
+fn parse_signers_from_apk(
+    path: &Path,
+) -> Result<(Vec<SignerInfo>, Vec<String>), (BackendError, Vec<String>)> {
+    let file = File::open(path).map_err(|_| (BackendError::ApkOpenFailed, Vec::new()))?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|_| (BackendError::ApkOpenFailed, Vec::new()))?;
+    let mut warnings = Vec::new();
+    let signers = signer_reader::extract_signers(path, &mut archive, &mut warnings);
+    Ok((signers, warnings))
 }
 
 fn should_resolve_app_name_with_rust(app_name: &str) -> bool {
@@ -193,6 +287,8 @@ mod warnings {
     pub const APP_NAME_PICKED_AAPT_LABEL: &str = "APP_NAME_PICKED_AAPT_LABEL";
     pub const ICON_PICKED_AAPT_BADGING: &str = "ICON_PICKED_AAPT_BADGING";
     pub const ICON_PICKED_AAPT_XMLTREE: &str = "ICON_PICKED_AAPT_XMLTREE";
+    pub const SIGNATURE_DEFERRED: &str = "SIGNATURE_DEFERRED";
+    pub const SIGNATURE_PARSE_FAILED: &str = "SIGNATURE_PARSE_FAILED";
     pub const SIGNATURE_PARTIAL: &str = "SIGNATURE_PARTIAL";
     pub const SIGNATURE_BLOCK_DETECTED_UNPARSED: &str = "SIGNATURE_BLOCK_DETECTED_UNPARSED";
     pub const MANIFEST_BINARY_PARTIAL: &str = "MANIFEST_BINARY_PARTIAL";
@@ -2928,7 +3024,7 @@ application-label-zh:'中文名'
         };
         let mut warnings = vec![super::warnings::APP_NAME_PICKED_AAPT_LABEL.to_string()];
 
-        enrich_aapt_data(&apk, &mut data, &mut warnings);
+        enrich_aapt_data(&apk, &mut data, &mut warnings, true);
 
         assert!(data.icon_url.ends_with(".png"));
         assert!(
@@ -2978,7 +3074,7 @@ application-label-zh:'中文名'
         };
         let mut warnings = vec![super::warnings::ICON_PICKED_AAPT_BADGING.to_string()];
 
-        enrich_aapt_data(&apk, &mut data, &mut warnings);
+        enrich_aapt_data(&apk, &mut data, &mut warnings, true);
 
         assert_eq!(data.icon_url, existing_icon_url);
         assert!(warnings
@@ -3394,11 +3490,14 @@ application-label-zh:'中文名'
     }
 
     #[test]
-    fn tauri_and_direct_parser_are_consistent() {
+    fn tauri_parser_defers_signers_but_keeps_core_data() {
         let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android"></manifest>"#;
         let apk = build_zip_with_name(
             "demo.apk",
-            vec![("AndroidManifest.xml", manifest.as_bytes())],
+            vec![
+                ("AndroidManifest.xml", manifest.as_bytes()),
+                ("META-INF/CERT.RSA", b"dummy-cert"),
+            ],
         );
 
         let direct = parse_apk_to_envelope(&apk);
@@ -3408,8 +3507,34 @@ application-label-zh:'中文名'
         assert_eq!(direct.data.package_name, tauri.data.package_name);
         assert_eq!(direct.data.channel, tauri.data.channel);
         assert_eq!(direct.data.permissions, tauri.data.permissions);
-        assert_eq!(direct.data.signers.len(), tauri.data.signers.len());
         assert_eq!(direct.data.abis, tauri.data.abis);
+        assert!(!direct.data.signers.is_empty());
+        assert!(tauri.data.signers.is_empty());
+        assert!(tauri
+            .warnings
+            .iter()
+            .any(|item| item == warnings::SIGNATURE_DEFERRED));
+    }
+
+    #[test]
+    fn tauri_signer_parser_returns_deferred_signers() {
+        let manifest = r#"<manifest package="com.demo.app" xmlns:android="http://schemas.android.com/apk/res/android"></manifest>"#;
+        let apk = build_zip_with_name(
+            "signed-deferred.apk",
+            vec![
+                ("AndroidManifest.xml", manifest.as_bytes()),
+                ("META-INF/CERT.RSA", b"dummy-cert"),
+            ],
+        );
+
+        let result = parse_signers_tauri(apk.to_string_lossy().to_string());
+
+        assert!(result.success);
+        assert_eq!(result.signers.len(), 1);
+        assert!(result
+            .warnings
+            .iter()
+            .any(|item| item == warnings::SIGNATURE_PARTIAL));
     }
 
     #[test]

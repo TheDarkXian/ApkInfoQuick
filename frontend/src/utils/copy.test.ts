@@ -9,6 +9,8 @@ function makeTab(overrides: Partial<FileTab> = {}): FileTab {
     path: "D:/tmp/demo.apk",
     ext: "apk",
     status: "success",
+    signerStatus: "success",
+    signerError: null,
     localError: null,
     createdAt: 1,
     envelope: {
@@ -68,4 +70,3 @@ describe("renderCopyJson", () => {
     expect(parsed.path).toBe("D:/tmp/demo.aab");
   });
 });
-

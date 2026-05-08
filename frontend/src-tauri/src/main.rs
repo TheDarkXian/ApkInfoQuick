@@ -1,5 +1,5 @@
-use apk_info_backend::model::{ApkInfoData, ApkInfoEnvelope};
-use apk_info_backend::parser::parse_apk_tauri;
+use apk_info_backend::model::{ApkInfoData, ApkInfoEnvelope, SignerParseResult};
+use apk_info_backend::parser::{parse_apk_tauri, parse_signers_tauri};
 use base64::Engine;
 use tauri::{path::BaseDirectory, Manager};
 
@@ -12,6 +12,19 @@ async fn parse_apk(file_path: String) -> ApkInfoEnvelope {
                 "PARSE_WORKER_FAILED",
                 format!("解析任务执行失败: {err}"),
                 ApkInfoData::placeholder(),
+                Vec::new(),
+            )
+        })
+}
+
+#[tauri::command]
+async fn parse_signers(file_path: String) -> SignerParseResult {
+    tauri::async_runtime::spawn_blocking(move || parse_signers_tauri(file_path))
+        .await
+        .unwrap_or_else(|err| {
+            SignerParseResult::err(
+                "SIGNATURE_WORKER_FAILED",
+                format!("签名解析任务执行失败: {err}"),
                 Vec::new(),
             )
         })
@@ -102,6 +115,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             parse_apk,
+            parse_signers,
             pick_files,
             read_icon_data_url,
             export_icon_with_dialog

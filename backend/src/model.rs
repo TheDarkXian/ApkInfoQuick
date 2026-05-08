@@ -38,6 +38,38 @@ pub struct SignerInfo {
     pub valid_to: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignerParseResult {
+    pub success: bool,
+    pub signers: Vec<SignerInfo>,
+    pub warnings: Vec<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
+impl SignerParseResult {
+    pub fn ok(signers: Vec<SignerInfo>, warnings: Vec<String>) -> Self {
+        Self {
+            success: true,
+            signers,
+            warnings,
+            error_code: None,
+            error_message: None,
+        }
+    }
+
+    pub fn err(code: &str, message: String, warnings: Vec<String>) -> Self {
+        Self {
+            success: false,
+            signers: Vec::new(),
+            warnings,
+            error_code: Some(code.to_string()),
+            error_message: Some(message),
+        }
+    }
+}
+
 impl ApkInfoData {
     pub fn placeholder() -> Self {
         Self {

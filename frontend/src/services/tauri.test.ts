@@ -11,6 +11,15 @@ const { invokeMock } = vi.hoisted(() => ({
     if (cmd === "export_icon_with_dialog") {
       return "D:/export/app-icon.png" as unknown;
     }
+    if (cmd === "parse_signers") {
+      return {
+        success: true,
+        signers: [{ scheme: "v1", certSha256: "abc", issuer: "unknown", subject: "CN=Demo", validFrom: "", validTo: "" }],
+        warnings: ["SIGNATURE_PARTIAL"],
+        errorCode: null,
+        errorMessage: null
+      } as unknown;
+    }
     return {
       success: true,
       data: {
@@ -38,7 +47,7 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: invokeMock
 }));
 
-import { exportIconWithDialog, parseApk, pickFiles, readIconDataUrl } from "./tauri";
+import { exportIconWithDialog, parseApk, parseSigners, pickFiles, readIconDataUrl } from "./tauri";
 
 describe("parseApk", () => {
   it("invokes tauri parse command and returns normalized envelope", async () => {
@@ -48,6 +57,18 @@ describe("parseApk", () => {
     expect(result.envelope.success).toBe(true);
     expect(result.envelope.data.packageName).toBe("com.example.app");
     expect(invokeMock).toHaveBeenCalledWith("parse_apk", { filePath: "D:/tmp/demo.apk" });
+  });
+});
+
+describe("parseSigners", () => {
+  it("invokes tauri signer command and returns normalized signer result", async () => {
+    invokeMock.mockClear();
+    const result = await parseSigners("D:/tmp/demo.apk");
+    expect(result.requestedPath).toBe("D:/tmp/demo.apk");
+    expect(result.success).toBe(true);
+    expect(result.signers[0].certSha256).toBe("abc");
+    expect(result.warnings).toEqual(["SIGNATURE_PARTIAL"]);
+    expect(invokeMock).toHaveBeenCalledWith("parse_signers", { filePath: "D:/tmp/demo.apk" });
   });
 });
 

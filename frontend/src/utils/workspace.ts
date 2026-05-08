@@ -84,6 +84,8 @@ export function createTabsFromPaths(
       status: "pending",
       envelope: null,
       localError: null,
+      signerStatus: "idle",
+      signerError: null,
       createdAt: now
     };
 

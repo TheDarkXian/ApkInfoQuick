@@ -49,6 +49,8 @@ describe("warning labels", () => {
         "ICON_RESOURCE_ID_UNRESOLVED",
         "MANIFEST_BINARY_PARTIAL",
         "SIGNATURE_BLOCK_DETECTED_UNPARSED",
+        "SIGNATURE_DEFERRED",
+        "SIGNATURE_PARSE_FAILED",
         "SIGNATURE_PARTIAL"
       ].sort()
     );

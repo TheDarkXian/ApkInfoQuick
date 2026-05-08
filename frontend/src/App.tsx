@@ -34,7 +34,7 @@ import {
   Tooltip,
   Typography
 } from "@mui/material";
-import { exportIconWithDialog, parseApk, pickFiles, readIconDataUrl } from "./services/tauri";
+import { exportIconWithDialog, parseApk, parseSigners, pickFiles, readIconDataUrl } from "./services/tauri";
 import { isIconPickedWarning, toWarningLabel } from "./constants/warnings";
 import { ApkInfoData, Signer } from "./types/apk";
 import { FileTab, TabStatus } from "./types/tab";
@@ -86,6 +86,8 @@ function App() {
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [parseQueue, setParseQueue] = useState<ParseJob[]>([]);
   const [currentParseJob, setCurrentParseJob] = useState<ParseJob | null>(null);
+  const [signerQueue, setSignerQueue] = useState<ParseJob[]>([]);
+  const [currentSignerJob, setCurrentSignerJob] = useState<ParseJob | null>(null);
   const [dragging, setDragging] = useState(false);
   const [toast, setToast] = useState<ToastState>({
     open: false,
@@ -99,6 +101,8 @@ function App() {
   const tabsRef = useRef<FileTab[]>([]);
   const parseQueueRef = useRef<ParseJob[]>([]);
   const currentParseJobRef = useRef<ParseJob | null>(null);
+  const signerQueueRef = useRef<ParseJob[]>([]);
+  const currentSignerJobRef = useRef<ParseJob | null>(null);
 
   const activeTab = useMemo(
     () => tabs.find((item) => item.id === activeTabId) ?? null,
@@ -130,6 +134,18 @@ function App() {
   const setCurrentParseJobSynced = useCallback((job: ParseJob | null) => {
     currentParseJobRef.current = job;
     setCurrentParseJob(job);
+  }, []);
+
+  const setSignerQueueSynced = useCallback((updater: (prev: ParseJob[]) => ParseJob[]) => {
+    const next = updater(signerQueueRef.current);
+    signerQueueRef.current = next;
+    setSignerQueue(next);
+    return next;
+  }, []);
+
+  const setCurrentSignerJobSynced = useCallback((job: ParseJob | null) => {
+    currentSignerJobRef.current = job;
+    setCurrentSignerJob(job);
   }, []);
 
   const addFiles = useCallback(
@@ -223,6 +239,7 @@ function App() {
     });
 
     setParseQueueSynced((prev) => prev.filter((job) => job.id !== closingTabId));
+    setSignerQueueSynced((prev) => prev.filter((job) => job.id !== closingTabId));
     setTabIconUrls((prev) => omitIconCache(prev, [closingTabId]));
   }
 
@@ -235,6 +252,7 @@ function App() {
       return next;
     });
     setParseQueueSynced((prev) => prev.filter((job) => job.id === activeTabId));
+    setSignerQueueSynced((prev) => prev.filter((job) => job.id === activeTabId));
     setTabIconUrls((prev) => {
       const kept = activeTabId ? prev[activeTabId] : undefined;
       return activeTabId && kept !== undefined ? { [activeTabId]: kept } : {};
@@ -245,6 +263,7 @@ function App() {
     setTabsSynced(() => []);
     setActiveTabId(null);
     setParseQueueSynced(() => []);
+    setSignerQueueSynced(() => []);
     setTabIconUrls({});
   }
 
@@ -259,7 +278,9 @@ function App() {
           ? {
               ...item,
               status: "pending",
-              localError: null
+              localError: null,
+              signerStatus: "idle",
+              signerError: null
             }
           : item
       );
@@ -267,6 +288,7 @@ function App() {
     });
     setTabIconUrls((prev) => omitIconCache(prev, [activeTab.id]));
     setParseQueueSynced((prev) => [...prev, { id: activeTab.id, path: activeTab.path }]);
+    setSignerQueueSynced((prev) => prev.filter((job) => job.id !== activeTab.id));
   }
 
   async function copyCurrentText() {
@@ -304,6 +326,10 @@ function App() {
   useEffect(() => {
     parseQueueRef.current = parseQueue;
   }, [parseQueue]);
+
+  useEffect(() => {
+    signerQueueRef.current = signerQueue;
+  }, [signerQueue]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -369,6 +395,7 @@ function App() {
 
     void parseApk(currentJob.path)
       .then((result) => {
+        const shouldParseSigners = result.envelope.success && result.envelope.warnings.includes("SIGNATURE_DEFERRED");
         setTabsSynced((prev) => {
           if (!prev.some((item) => item.id === currentJob.id)) {
             return prev;
@@ -381,11 +408,18 @@ function App() {
               ...item,
               envelope: result.envelope,
               status: result.envelope.success ? "success" : "error",
-              localError: result.envelope.success ? null : result.envelope.errorMessage || "解析失败"
+              localError: result.envelope.success ? null : result.envelope.errorMessage || "解析失败",
+              signerStatus: shouldParseSigners ? "pending" : result.envelope.success ? "success" : "idle",
+              signerError: null
             };
           });
           return next;
         });
+        if (shouldParseSigners && tabsRef.current.some((item) => item.id === currentJob.id)) {
+          setSignerQueueSynced((prev) =>
+            prev.some((job) => job.id === currentJob.id) ? prev : [...prev, { id: currentJob.id, path: currentJob.path }]
+          );
+        }
       })
       .catch((error) => {
         setTabsSynced((prev) => {
@@ -399,7 +433,9 @@ function App() {
             return {
               ...item,
               status: "error",
-              localError: error instanceof Error ? error.message : "解析请求失败"
+              localError: error instanceof Error ? error.message : "解析请求失败",
+              signerStatus: "idle",
+              signerError: null
             };
           });
           return next;
@@ -408,7 +444,91 @@ function App() {
       .finally(() => {
         setCurrentParseJobSynced(null);
       });
-  }, [currentParseJob, parseQueue, setCurrentParseJobSynced, setParseQueueSynced, setTabsSynced]);
+  }, [currentParseJob, parseQueue, setCurrentParseJobSynced, setParseQueueSynced, setSignerQueueSynced, setTabsSynced]);
+
+  useEffect(() => {
+    if (currentSignerJob || signerQueue.length === 0) {
+      return;
+    }
+
+    const currentJob = signerQueueRef.current[0];
+    if (!currentJob) {
+      return;
+    }
+    setSignerQueueSynced((prev) => prev.slice(1));
+    setCurrentSignerJobSynced(currentJob);
+
+    setTabsSynced((prev) =>
+      prev.map((item): FileTab =>
+        item.id === currentJob.id
+          ? {
+              ...item,
+              signerStatus: "parsing",
+              signerError: null
+            }
+          : item
+      )
+    );
+
+    void parseSigners(currentJob.path)
+      .then((result) => {
+        setTabsSynced((prev) => {
+          if (!prev.some((item) => item.id === currentJob.id)) {
+            return prev;
+          }
+          return prev.map((item): FileTab => {
+            if (item.id !== currentJob.id || !item.envelope) {
+              return item;
+            }
+            if (!result.success) {
+              return {
+                ...item,
+                signerStatus: "error",
+                signerError: result.errorMessage || "签名解析失败",
+                envelope: {
+                  ...item.envelope,
+                  warnings: mergeWarnings(item.envelope.warnings, [...result.warnings, "SIGNATURE_PARSE_FAILED"])
+                }
+              };
+            }
+            return {
+              ...item,
+              signerStatus: "success",
+              signerError: null,
+              envelope: {
+                ...item.envelope,
+                data: {
+                  ...item.envelope.data,
+                  signers: result.signers
+                },
+                warnings: mergeWarnings(item.envelope.warnings, result.warnings)
+              }
+            };
+          });
+        });
+      })
+      .catch((error) => {
+        setTabsSynced((prev) =>
+          prev.map((item): FileTab => {
+            if (item.id !== currentJob.id || !item.envelope) {
+              return item;
+            }
+            return {
+              ...item,
+              signerStatus: "error",
+              signerError: error instanceof Error ? error.message : "签名解析请求失败",
+              envelope: {
+                ...item.envelope,
+                warnings: mergeWarnings(item.envelope.warnings, ["SIGNATURE_PARSE_FAILED"])
+              }
+            };
+          })
+        );
+      })
+      .finally(() => {
+        setCurrentSignerJobSynced(null);
+      });
+  }, [currentSignerJob, setCurrentSignerJobSynced, setSignerQueueSynced, setTabsSynced, signerQueue]);
 
   useEffect(() => {
     if (!activeTabId && tabs.length > 0) {
@@ -483,7 +603,12 @@ function App() {
     return iconResolvedSuccessfully;
   });
   const primaryWarnings = allWarnings.filter((item) => !isIconPickedWarning(item) && !diagnosticWarnings.includes(item));
-  const signerDefaultExpanded = Boolean(activeData?.signers.some(hasMeaningfulSignerValue));
+  const activeSignerStatus = activeTab?.signerStatus ?? "idle";
+  const signerDefaultExpanded =
+    activeSignerStatus === "pending" ||
+    activeSignerStatus === "parsing" ||
+    activeSignerStatus === "error" ||
+    Boolean(activeData?.signers.some(hasMeaningfulSignerValue));
 
   useEffect(() => {
     let active = true;
@@ -734,10 +859,20 @@ function App() {
                         </Button>
                       </Stack>
                       <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.35 }}>
-                        {getSignerSummary(activeData.signers, hasSignaturePartialRisk)}
+                        {getSignerSummary(activeData.signers, hasSignaturePartialRisk, activeTab.signerStatus)}
                       </Typography>
                       {signerExpanded && (
                         <Stack spacing={0.55} sx={{ mt: 0.45 }}>
+                          {(activeTab.signerStatus === "pending" || activeTab.signerStatus === "parsing") && (
+                            <Alert severity="info" sx={{ mb: 0.3, py: 0 }}>
+                              签名解析中...核心信息已先展示，签名完成后会自动补充。
+                            </Alert>
+                          )}
+                          {activeTab.signerStatus === "error" && (
+                            <Alert severity="error" sx={{ mb: 0.3, py: 0 }}>
+                              {activeTab.signerError || "签名解析失败，但核心信息已可用。"}
+                            </Alert>
+                          )}
                           {hasSignaturePartialRisk && (
                             <Alert severity="warning" sx={{ mb: 0.3, py: 0 }}>
                               当前签名信息为尽力解析，部分证书元数据可能不完整。
@@ -1104,11 +1239,27 @@ function isMeaningfulText(value: string): boolean {
   return Boolean(normalized && normalized !== "unknown" && normalized !== EMPTY_TEXT.toLowerCase());
 }
 
-function getSignerSummary(signers: Signer[], hasPartialRisk: boolean): string {
+function getSignerSummary(signers: Signer[], hasPartialRisk: boolean, signerStatus: FileTab["signerStatus"]): string {
+  if (signerStatus === "pending" || signerStatus === "parsing") {
+    return "签名：解析中";
+  }
+  if (signerStatus === "error") {
+    return "签名：解析失败";
+  }
   if (signers.length === 0 || !signers.some(hasMeaningfulSignerValue)) {
     return "签名：无可用信息";
   }
   return hasPartialRisk ? `签名：${signers.length} 个，部分字段未识别` : `签名：${signers.length} 个`;
+}
+
+function mergeWarnings(current: string[], incoming: string[]): string[] {
+  const next = [...current];
+  for (const warning of incoming) {
+    if (!next.includes(warning)) {
+      next.push(warning);
+    }
+  }
+  return next;
 }
 
 function toLocalFilePath(iconUrl: string): string | null {

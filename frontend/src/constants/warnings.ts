@@ -23,6 +23,8 @@
   APP_NAME_PICKED_RESOURCE_ID: "应用名来源：resources.arsc 反查",
   APP_NAME_PICKED_AAPT_LABEL: "应用名来源：aapt label",
   APP_NAME_UNRESOLVED: "应用名资源未能解析",
+  SIGNATURE_DEFERRED: "签名信息已转入后台解析",
+  SIGNATURE_PARSE_FAILED: "签名解析失败",
   SIGNATURE_PARTIAL: "签名信息为尽力解析，可能不完整",
   SIGNATURE_BLOCK_DETECTED_UNPARSED: "检测到 APK 签名块，但未完成完整解析",
   MANIFEST_BINARY_PARTIAL: "Manifest 为二进制且解析信息不完整"
